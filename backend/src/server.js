@@ -8,12 +8,14 @@ import routes from './routes.js';
 import { seedAdmin } from './users.js';
 import { attachUser, requireAuth } from './auth.js';
 import { MEDIA_DIR, stop as stopBroadcast } from './broadcast.js';
+import { startScheduler, stopScheduler } from './scheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 4000;
 
 loadConfig();
 seedAdmin();
+startScheduler();
 
 const app = express();
 app.set('trust proxy', true);
@@ -108,6 +110,7 @@ const server = app.listen(PORT, () => {
 
 function shutdown() {
   console.log('\nShutting down…');
+  try { stopScheduler(); } catch {}
   try { stopBroadcast(); } catch {}
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000).unref();

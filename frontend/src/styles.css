@@ -1313,3 +1313,192 @@ body {
   font-family: var(--display);
   margin: 0;
 }
+
+/* =========================================================================
+   PACKAGE SEARCH · FAVORITE CHANNELS  (added with search + favorites)
+   ========================================================================= */
+
+/* search box inside the Packages panel */
+.catsearch {
+  margin: 0 0 10px;
+  width: 100%;
+}
+
+/* the synthetic ★ Favorites entry at the top of the package list */
+.catitem-fav {
+  border: 1px dashed var(--amber-dim);
+  background: rgba(255, 182, 39, 0.05);
+}
+.catitem-fav .catname {
+  color: var(--amber);
+}
+.catitem-fav .muted-count {
+  color: var(--amber);
+}
+.catitem-fav.active {
+  border-style: solid;
+}
+
+/* star toggle on each channel card */
+.chfav {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 8px;
+  background: rgba(10, 11, 14, 0.6);
+  color: var(--faint);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease, transform 0.12s ease;
+}
+.chfav:hover {
+  background: rgba(10, 11, 14, 0.85);
+  color: var(--amber);
+  transform: scale(1.12);
+}
+.chfav.on {
+  color: var(--amber);
+}
+
+/* =========================================================================
+   BROADCAST SCHEDULES  (added with scheduling)
+   ========================================================================= */
+
+.sched-page {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 20px;
+}
+.sched-grid {
+  display: grid;
+  grid-template-columns: 420px 1fr;
+  gap: 18px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .sched-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.sched-picked {
+  font-size: 14px;
+  color: var(--text);
+  background: var(--ink-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.sched-picked .muted {
+  color: var(--faint);
+  font-family: var(--mono);
+}
+
+/* weekday picker */
+.daypick {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.daybtn {
+  border: 1px solid var(--line);
+  background: var(--ink-2);
+  color: var(--muted);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.daybtn:hover {
+  border-color: var(--faint);
+}
+.daybtn.on {
+  background: rgba(255, 182, 39, 0.12);
+  border-color: var(--amber-dim);
+  color: var(--amber);
+}
+
+.sched-formactions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* schedule cards */
+.sched-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sched-card {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  grid-template-areas:
+    'logo main'
+    'actions actions';
+  align-items: center;
+  gap: 8px 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--ink-2);
+}
+.sched-card.is-off {
+  opacity: 0.55;
+}
+.sched-logo {
+  grid-area: logo;
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border-radius: 8px;
+  background: var(--ink);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+.sched-logo img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.sched-main {
+  grid-area: main;
+  min-width: 0;
+}
+.sched-name {
+  font-size: 15px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sched-when {
+  font-size: 12px;
+  color: var(--faint);
+  font-family: var(--mono);
+  margin-top: 3px;
+}
+.sched-actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+/* time/date inputs match the dark theme */
+.field input[type='time'],
+.field input[type='date'] {
+  color-scheme: dark;
+}

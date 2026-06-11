@@ -14,6 +14,8 @@ import {
   clearSessionCookie,
 } from './auth.js';
 import * as users from './users.js';
+import * as favorites from './favorites.js';
+import * as scheduler from './scheduler.js';
 
 const router = express.Router();
 
@@ -235,6 +237,73 @@ router.post('/broadcast/start', requireRole('control'), async (req, res) => {
 
 router.post('/broadcast/stop', requireRole('control'), (req, res) => {
   res.json({ ok: true, broadcast: broadcast.stop() });
+});
+
+// ============================================================
+//  Favorite channels  (per-user; control+ — anyone who picks channels)
+// ============================================================
+
+router.get('/favorites', requireRole('control'), (req, res) => {
+  res.json({ favorites: favorites.listFavorites(req.user.id) });
+});
+
+router.post('/favorites', requireRole('control'), (req, res) => {
+  try {
+    const { streamId, name, icon, categoryId } = req.body || {};
+    const list = favorites.addFavorite(req.user.id, { streamId, name, icon, categoryId });
+    res.json({ favorites: list });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.delete('/favorites/:streamId', requireRole('control'), (req, res) => {
+  const list = favorites.removeFavorite(req.user.id, req.params.streamId);
+  res.json({ favorites: list });
+});
+
+// ============================================================
+//  Broadcast schedules  (admin only)
+// ============================================================
+
+router.get('/schedules', requireRole('admin'), (req, res) => {
+  res.json({ schedules: scheduler.listSchedules(), log: scheduler.getLog() });
+});
+
+router.post('/schedules', requireRole('admin'), (req, res) => {
+  try {
+    const schedule = scheduler.createSchedule(req.body || {}, req.user.id);
+    res.status(201).json({ schedule });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.put('/schedules/:id', requireRole('admin'), (req, res) => {
+  try {
+    const schedule = scheduler.updateSchedule(Number(req.params.id), req.body || {});
+    res.json({ schedule });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.post('/schedules/:id/enabled', requireRole('admin'), (req, res) => {
+  try {
+    const schedule = scheduler.setEnabled(Number(req.params.id), !!(req.body || {}).enabled);
+    res.json({ schedule });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.delete('/schedules/:id', requireRole('admin'), (req, res) => {
+  try {
+    scheduler.deleteSchedule(Number(req.params.id));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
 export default router;

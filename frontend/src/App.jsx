@@ -3,6 +3,7 @@ import { useState } from 'react';
 import Home from './pages/Home.jsx';
 import Admin from './pages/Admin.jsx';
 import Users from './pages/Users.jsx';
+import Schedules from './pages/Schedules.jsx';
 import Login from './pages/Login.jsx';
 import { AuthProvider, useAuth } from './auth.jsx';
 import * as api from './api.js';
@@ -55,6 +56,14 @@ function Shell() {
               </RequireRole>
             }
           />
+          <Route
+            path="/schedule"
+            element={
+              <RequireRole min="admin">
+                <Schedules />
+              </RequireRole>
+            }
+          />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
@@ -81,6 +90,14 @@ function TopBar() {
             className={({ isActive }) => 'navlink' + (isActive ? ' active' : '')}
           >
             Control&nbsp;Room
+          </NavLink>
+        )}
+        {is('admin') && (
+          <NavLink
+            to="/schedule"
+            className={({ isActive }) => 'navlink' + (isActive ? ' active' : '')}
+          >
+            Schedule
           </NavLink>
         )}
         {is('admin') && (

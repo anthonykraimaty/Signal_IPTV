@@ -112,3 +112,46 @@ export async function getLogs() {
   const d = await fetch('/api/logs', opts()).then((r) => asJson(r, 'Failed to load logs'));
   return d.logs;
 }
+
+// ---------- favorite channels (per-user) ----------
+export async function getFavorites() {
+  const d = await fetch('/api/favorites', opts()).then((r) => asJson(r, 'Failed to load favorites'));
+  return d.favorites;
+}
+export async function addFavorite(body) {
+  const d = await fetch('/api/favorites', jsonBody('POST', body)).then((r) =>
+    asJson(r, 'Failed to add favorite'),
+  );
+  return d.favorites;
+}
+export async function removeFavorite(streamId) {
+  const d = await fetch(`/api/favorites/${streamId}`, opts({ method: 'DELETE' })).then((r) =>
+    asJson(r, 'Failed to remove favorite'),
+  );
+  return d.favorites;
+}
+
+// ---------- broadcast schedules (admin) ----------
+export function getSchedules() {
+  return fetch('/api/schedules', opts()).then((r) => asJson(r, 'Failed to load schedules'));
+}
+export function createSchedule(body) {
+  return fetch('/api/schedules', jsonBody('POST', body)).then((r) =>
+    asJson(r, 'Failed to create schedule'),
+  );
+}
+export function updateSchedule(id, body) {
+  return fetch(`/api/schedules/${id}`, jsonBody('PUT', body)).then((r) =>
+    asJson(r, 'Failed to update schedule'),
+  );
+}
+export function setScheduleEnabled(id, enabled) {
+  return fetch(`/api/schedules/${id}/enabled`, jsonBody('POST', { enabled })).then((r) =>
+    asJson(r, 'Failed to update schedule'),
+  );
+}
+export function deleteSchedule(id) {
+  return fetch(`/api/schedules/${id}`, opts({ method: 'DELETE' })).then((r) =>
+    asJson(r, 'Failed to delete schedule'),
+  );
+}

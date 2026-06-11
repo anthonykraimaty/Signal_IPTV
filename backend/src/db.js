@@ -44,6 +44,34 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+  CREATE TABLE IF NOT EXISTS favorites (
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    stream_id   INTEGER NOT NULL,
+    name        TEXT,
+    icon        TEXT,
+    category_id TEXT,
+    added_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, stream_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
+
+  CREATE TABLE IF NOT EXISTS schedules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    stream_id   INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    icon        TEXT,
+    start_time  TEXT NOT NULL,             -- "HH:MM" (24h, server-local)
+    stop_time   TEXT,                       -- "HH:MM" or NULL (open-ended)
+    recurrence  TEXT NOT NULL DEFAULT 'once' CHECK (recurrence IN ('once','weekly')),
+    date        TEXT,                       -- "YYYY-MM-DD" for one-time runs
+    days        TEXT,                       -- CSV of weekday numbers 0..6 (Sun=0) for weekly
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    last_fired  TEXT                        -- "YYYY-MM-DDTHH:MM" marker to avoid double-firing
+  );
 `);
 
 export { DATA_DIR, DB_FILE };
