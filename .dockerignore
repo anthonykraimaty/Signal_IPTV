@@ -1,0 +1,20 @@
+# Never copy host dependencies or build artifacts into the build context.
+**/node_modules
+frontend/dist
+
+# Runtime state lives in named volumes, not in the image.
+backend/data
+backend/media
+
+# Secrets are injected at runtime, never baked in.
+backend/.env
+
+# CI / VCS / docs / scratch
+.git
+.github
+.claude
+.playwright-mcp
+*.log
+*.png
+README.md
+start-dev.ps1

@@ -1,0 +1,29 @@
+services:
+  signal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: signal-iptv:latest
+    container_name: signal-iptv
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-4000}:4000"
+    environment:
+      PORT: "4000"
+      # First-run admin seed (only used when the users table is empty).
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-change-me-now}"
+      FFMPEG_PATH: "ffmpeg"
+      X264_PRESET: "${X264_PRESET:-veryfast}"
+      HLS_TIME: "${HLS_TIME:-4}"
+      HLS_LIST_SIZE: "${HLS_LIST_SIZE:-6}"
+    volumes:
+      # Persist SQLite (credentials + users + sessions) across rebuilds.
+      - signal-data:/app/backend/data
+      # HLS output is regenerated each broadcast; a volume keeps it off the
+      # writable container layer (large, churny .ts segments).
+      - signal-media:/app/backend/media
+
+volumes:
+  signal-data:
+  signal-media:

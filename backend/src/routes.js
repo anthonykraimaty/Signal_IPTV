@@ -1,0 +1,240 @@
+import express from 'express';
+import * as xtream from './xtream.js';
+import * as broadcast from './broadcast.js';
+import { getXtream, setXtream, isConfigured } from './config.js';
+import {
+  verifyPassword,
+  createSession,
+  destroySession,
+  activeSessions,
+  destroyUserSessions,
+  requireAuth,
+  requireRole,
+  setSessionCookie,
+  clearSessionCookie,
+} from './auth.js';
+import * as users from './users.js';
+
+const router = express.Router();
+
+router.get('/health', (req, res) => res.json({ ok: true }));
+
+// ============================================================
+//  Auth
+// ============================================================
+
+router.post('/auth/login', (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required' });
+  }
+  const user = users.getUserByUsername(username);
+  if (!user || user.disabled || !verifyPassword(password, user.password_hash)) {
+    return res.status(401).json({ error: 'Invalid username or password' });
+  }
+  const token = createSession(user.id, {
+    userAgent: req.headers['user-agent'],
+    ip: req.ip,
+  });
+  setSessionCookie(res, token);
+  res.json({
+    user: { id: user.id, username: user.username, role: user.role, mustChange: !!user.must_change },
+  });
+});
+
+router.post('/auth/logout', (req, res) => {
+  destroySession(req.sessionToken);
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+// Who am I — drives the frontend auth state. 200 with user, or 401 if not logged in.
+router.get('/auth/me', requireAuth, (req, res) => {
+  res.json({ user: req.user });
+});
+
+// Change my own password (clears the must_change flag).
+router.post('/auth/password', requireAuth, (req, res) => {
+  try {
+    const { newPassword } = req.body || {};
+    users.changeOwnPassword(req.user.id, newPassword);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ============================================================
+//  User management (admin only)
+// ============================================================
+
+router.get('/users', requireRole('admin'), (req, res) => {
+  res.json({ users: users.listUsers(), roles: users.ROLES });
+});
+
+router.post('/users', requireRole('admin'), (req, res) => {
+  try {
+    const { username, password, role } = req.body || {};
+    const user = users.createUser({ username, password, role });
+    res.status(201).json({ user });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.delete('/users/:id', requireRole('admin'), (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (id === req.user.id) return res.status(400).json({ error: 'You cannot delete yourself' });
+    users.deleteUser(id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.post('/users/:id/password', requireRole('admin'), (req, res) => {
+  try {
+    const { password } = req.body || {};
+    users.resetPassword(Number(req.params.id), password);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.post('/users/:id/role', requireRole('admin'), (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { role } = req.body || {};
+    if (id === req.user.id && role !== 'admin') {
+      return res.status(400).json({ error: 'You cannot change your own admin role' });
+    }
+    const user = users.setRole(id, role);
+    res.json({ user });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.post('/users/:id/disabled', requireRole('admin'), (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (id === req.user.id) return res.status(400).json({ error: 'You cannot disable yourself' });
+    const user = users.setDisabled(id, !!(req.body || {}).disabled);
+    res.json({ user });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Who is logged in (active sessions). Admin only.
+router.get('/sessions', requireRole('admin'), (req, res) => {
+  const list = activeSessions().map((s) => ({
+    userId: s.user_id,
+    username: s.username,
+    role: s.role,
+    createdAt: s.created_at,
+    lastSeen: s.last_seen,
+    ip: s.ip,
+    userAgent: s.user_agent,
+    current: s.token === req.sessionToken,
+  }));
+  res.json({ sessions: list });
+});
+
+// Force-logout every session of a user (does not disable the account). Admin only.
+router.delete('/sessions/user/:id', requireRole('admin'), (req, res) => {
+  destroyUserSessions(Number(req.params.id));
+  res.json({ ok: true });
+});
+
+// ============================================================
+//  Status / logs  (any logged-in user can read)
+// ============================================================
+
+router.get('/status', requireAuth, (req, res) => {
+  res.json({ configured: isConfigured(), broadcast: broadcast.getStatus() });
+});
+
+router.get('/logs', requireRole('control'), (req, res) =>
+  res.json({ logs: broadcast.getLogs() }),
+);
+
+// ============================================================
+//  Xtream credentials  (admin only — the "Source")
+// ============================================================
+
+router.get('/credentials', requireRole('admin'), (req, res) => {
+  const x = getXtream();
+  res.json({
+    configured: isConfigured(),
+    host: x.host || '',
+    username: x.username || '',
+    hasPassword: Boolean(x.password),
+  });
+});
+
+router.post('/credentials', requireRole('admin'), async (req, res) => {
+  try {
+    const { host, username, password } = req.body || {};
+    if (!host || !username || password === undefined || password === '') {
+      return res.status(400).json({ error: 'host, username and password are all required' });
+    }
+    setXtream({ host, username, password });
+    const info = await xtream.authenticate();
+    res.json({ ok: true, userInfo: info.user_info, serverInfo: info.server_info });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ============================================================
+//  Browse packages / channels  (control+ — needed to pick a channel)
+// ============================================================
+
+router.get('/categories', requireRole('control'), async (req, res) => {
+  try {
+    res.json({ categories: await xtream.getLiveCategories() });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.get('/categories/:id/streams', requireRole('control'), async (req, res) => {
+  try {
+    res.json({ streams: await xtream.getLiveStreams(req.params.id) });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ============================================================
+//  Broadcast control  (control+)
+// ============================================================
+
+router.post('/broadcast/start', requireRole('control'), async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(400).json({ error: 'Configure Xtream credentials first' });
+    }
+    const { streamId, name, icon } = req.body || {};
+    if (!streamId && streamId !== 0) {
+      return res.status(400).json({ error: 'streamId is required' });
+    }
+    const url = xtream.buildStreamUrl(streamId);
+    const status = await broadcast.start(
+      { id: streamId, name: name || `Channel ${streamId}`, icon: icon || null },
+      url,
+    );
+    res.json({ ok: true, broadcast: status });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.post('/broadcast/stop', requireRole('control'), (req, res) => {
+  res.json({ ok: true, broadcast: broadcast.stop() });
+});
+
+export default router;

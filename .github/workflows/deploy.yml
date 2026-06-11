@@ -1,0 +1,56 @@
+name: Deploy
+
+# Deploy on every push to main: SSH to the server, pull the new code,
+# rebuild the Docker image (which re-builds the frontend and serves it via
+# the backend), and restart the container.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  # Never let two deploys race on the server; cancel the older run.
+  group: deploy-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          # Fail the job on any error in the remote script.
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            DEPLOY_DIR="/home/admin/signal-iptv"
+            REPO_URL="https://github.com/anthonykraimaty/Signal_IPTV.git"
+            BRANCH="main"
+
+            # Clone on first deploy, otherwise fast-forward to the pushed commit.
+            if [ ! -d "$DEPLOY_DIR/.git" ]; then
+              git clone --branch "$BRANCH" "$REPO_URL" "$DEPLOY_DIR"
+            fi
+            cd "$DEPLOY_DIR"
+            git fetch --prune origin "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+
+            # docker compose v2 (plugin) preferred; fall back to legacy binary.
+            if docker compose version >/dev/null 2>&1; then
+              DC="docker compose"
+            else
+              DC="docker-compose"
+            fi
+
+            # Rebuild the image (re-builds the frontend in the build stage) and
+            # restart the container. --build forces a fresh image from the new code.
+            $DC up -d --build --remove-orphans
+
+            # Drop dangling images from previous builds to reclaim disk.
+            docker image prune -f

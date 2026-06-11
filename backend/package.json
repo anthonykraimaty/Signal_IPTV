@@ -1,0 +1,15 @@
+{
+  "name": "iptv-restream-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ingest an Xtream Codes IPTV channel and re-broadcast it as adaptive-bitrate HLS",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "dev": "node --env-file-if-exists=.env --watch src/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}

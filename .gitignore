@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output
+frontend/dist/
+
+# Runtime data & secrets (per-environment)
+backend/data/
+backend/media/
+backend/.env
+
+# SQLite working files
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+
+# Local screenshots / scratch
+*.png
+.playwright-mcp/
+
+# OS / editor
+.DS_Store
+Thumbs.db
