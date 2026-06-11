@@ -20,10 +20,12 @@ jobs:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
+          # Host/user/port are non-sensitive → repository Variables (vars.*).
+          # Only the private key is a Secret.
+          host: ${{ vars.SSH_HOST }}
+          username: ${{ vars.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
+          port: ${{ vars.SSH_PORT || 22 }}
           # Fail the job on any error in the remote script.
           script_stop: true
           script: |
