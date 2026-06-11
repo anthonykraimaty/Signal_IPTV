@@ -8,20 +8,33 @@ import {
   stopBroadcast,
   getStatus,
   getLogs,
+  getFavorites,
+  addFavorite,
+  removeFavorite,
 } from '../api.js';
+import { useAuth } from '../auth.jsx';
+
+// Synthetic "package" representing the current user's favorites.
+const FAV_CAT = { category_id: '__fav__', category_name: '★ Favorites' };
 
 export default function Admin() {
+  const { is } = useAuth();
+  const isAdmin = is('admin');
+
   const [cred, setCred] = useState({ host: '', username: '', password: '' });
   const [configured, setConfigured] = useState(false);
   const [credBusy, setCredBusy] = useState(false);
   const [credMsg, setCredMsg] = useState(null);
 
   const [categories, setCategories] = useState([]);
+  const [catFilter, setCatFilter] = useState('');
   const [activeCat, setActiveCat] = useState(null);
   const [streams, setStreams] = useState([]);
   const [loadingStreams, setLoadingStreams] = useState(false);
   const [filter, setFilter] = useState('');
   const [selected, setSelected] = useState(null);
+
+  const [favorites, setFavorites] = useState([]); // [{streamId, name, icon, categoryId}]
 
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -31,17 +44,22 @@ export default function Admin() {
   const [logs, setLogs] = useState([]);
 
   useEffect(() => {
-    getCredentials()
-      .then((c) => {
-        setCred({ host: c.host || '', username: c.username || '', password: '' });
-        setConfigured(c.configured);
-        if (c.configured) loadCategories();
-      })
-      .catch(() => {});
+    // Admins manage the source; control users only browse, so guard the creds call.
+    if (isAdmin) {
+      getCredentials()
+        .then((c) => {
+          setCred({ host: c.host || '', username: c.username || '', password: '' });
+          setConfigured(c.configured);
+        })
+        .catch(() => {});
+    }
+    // Everyone with control+ can list packages and favorites.
+    loadCategories();
+    loadFavorites();
     refreshStatus();
     const id = setInterval(refreshStatus, 4000);
     return () => clearInterval(id);
-  }, []);
+  }, [isAdmin]);
 
   useEffect(() => {
     if (!showLogs) return;
@@ -65,9 +83,41 @@ export default function Admin() {
 
   async function loadCategories() {
     try {
-      setCategories(await getCategories());
-    } catch (e) {
-      setErr(e.message);
+      const cats = await getCategories();
+      setCategories(cats);
+      // A successful package load means the source is linked (covers control users
+      // who can't read /api/credentials).
+      if (cats.length) setConfigured(true);
+    } catch {
+      // Not linked yet, or no permission — leave the list empty.
+    }
+  }
+
+  async function loadFavorites() {
+    try {
+      setFavorites(await getFavorites());
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const isFav = (streamId) => favorites.some((f) => f.streamId === streamId);
+
+  async function toggleFav(s, e) {
+    if (e) e.stopPropagation();
+    const streamId = s.stream_id ?? s.streamId;
+    try {
+      const next = isFav(streamId)
+        ? await removeFavorite(streamId)
+        : await addFavorite({
+            streamId,
+            name: s.name,
+            icon: s.stream_icon ?? s.icon ?? null,
+            categoryId: activeCat && activeCat !== FAV_CAT ? activeCat.category_id : s.categoryId,
+          });
+      setFavorites(next);
+    } catch (e2) {
+      setErr(e2.message);
     }
   }
 
@@ -93,11 +143,19 @@ export default function Admin() {
 
   async function openCategory(cat) {
     setActiveCat(cat);
-    setLoadingStreams(true);
-    setStreams([]);
     setFilter('');
     setSelected(null);
     setErr(null);
+
+    // The favorites pseudo-package renders the saved list — no remote fetch.
+    if (cat.category_id === FAV_CAT.category_id) {
+      setStreams([]);
+      setLoadingStreams(false);
+      return;
+    }
+
+    setLoadingStreams(true);
+    setStreams([]);
     try {
       setStreams(await getStreams(cat.category_id));
     } catch (e) {
@@ -112,9 +170,9 @@ export default function Admin() {
     setErr(null);
     try {
       await startBroadcast({
-        streamId: stream.stream_id,
+        streamId: stream.stream_id ?? stream.streamId,
         name: stream.name,
-        icon: stream.stream_icon,
+        icon: stream.stream_icon ?? stream.icon,
       });
       await refreshStatus();
     } catch (e) {
@@ -138,10 +196,30 @@ export default function Admin() {
 
   const b = status?.broadcast;
   const live = b?.status === 'live';
-  const starting = b?.status === 'starting';
+  // 'reconnecting' is a transitional state (source dropped, auto-retrying the
+  // same channel) — treat it as warm like 'starting' so the UI doesn't read
+  // "off air" while it's actively recovering.
+  const reconnecting = b?.status === 'reconnecting';
+  const starting = b?.status === 'starting' || reconnecting;
   const errored = b?.status === 'error';
-  const filtered = streams.filter(
+
+  const viewingFavs = activeCat?.category_id === FAV_CAT.category_id;
+  // In the favorites view, render the saved favorites as stream-shaped cards.
+  const sourceStreams = viewingFavs
+    ? favorites.map((f) => ({
+        stream_id: f.streamId,
+        name: f.name,
+        stream_icon: f.icon,
+        categoryId: f.categoryId,
+      }))
+    : streams;
+  const filtered = sourceStreams.filter(
     (s) => !filter || (s.name || '').toLowerCase().includes(filter.toLowerCase()),
+  );
+
+  // Package list with the search box + the synthetic Favorites entry on top.
+  const visibleCategories = categories.filter(
+    (c) => !catFilter || (c.category_name || '').toLowerCase().includes(catFilter.toLowerCase()),
   );
 
   return (
@@ -152,7 +230,7 @@ export default function Admin() {
           <span className="onair-light" />
           <div>
             <div className="onair-label">
-              {live ? 'ON AIR' : starting ? 'STARTING' : errored ? 'ERROR' : 'OFF AIR'}
+              {live ? 'ON AIR' : reconnecting ? 'RECONNECTING' : starting ? 'STARTING' : errored ? 'ERROR' : 'OFF AIR'}
             </div>
             <div className="onair-channel">{b?.channel?.name || '— no channel —'}</div>
           </div>
@@ -237,12 +315,38 @@ export default function Admin() {
               <h2>Packages</h2>
               <span className="muted-count">{categories.length}</span>
             </div>
+            {configured && categories.length > 0 && (
+              <input
+                className="search catsearch"
+                placeholder="Search packages…"
+                value={catFilter}
+                onChange={(e) => setCatFilter(e.target.value)}
+              />
+            )}
             <div className="catlist">
               {!configured && <div className="empty">Link a source to load packages.</div>}
+
+              {/* Favorites pseudo-package — always available once linked */}
+              {configured && (
+                <button
+                  className={
+                    'catitem catitem-fav' +
+                    (activeCat?.category_id === FAV_CAT.category_id ? ' active' : '')
+                  }
+                  onClick={() => openCategory(FAV_CAT)}
+                >
+                  <span className="catname">{FAV_CAT.category_name}</span>
+                  <span className="muted-count">{favorites.length}</span>
+                </button>
+              )}
+
               {configured && categories.length === 0 && (
                 <div className="empty">No packages found.</div>
               )}
-              {categories.map((c) => (
+              {configured && categories.length > 0 && visibleCategories.length === 0 && (
+                <div className="empty">No packages match “{catFilter}”.</div>
+              )}
+              {visibleCategories.map((c) => (
                 <button
                   key={c.category_id}
                   className={'catitem' + (activeCat?.category_id === c.category_id ? ' active' : '')}
@@ -260,7 +364,7 @@ export default function Admin() {
         <section className="panel col-right">
           <div className="panel-head">
             <h2>{activeCat ? activeCat.category_name : 'Channels'}</h2>
-            {streams.length > 0 && (
+            {sourceStreams.length > 0 && (
               <input
                 className="search"
                 placeholder="Filter channels…"
@@ -272,20 +376,37 @@ export default function Admin() {
 
           {!activeCat && <div className="empty big">Pick a package to browse its channels.</div>}
           {loadingStreams && <div className="empty big">Loading channels…</div>}
-          {activeCat && !loadingStreams && filtered.length === 0 && (
+          {viewingFavs && !loadingStreams && favorites.length === 0 && (
+            <div className="empty big">
+              No favorites yet. Open a package and tap the ★ on a channel to save it here.
+            </div>
+          )}
+          {activeCat && !viewingFavs && !loadingStreams && filtered.length === 0 && (
             <div className="empty big">No channels match.</div>
+          )}
+          {viewingFavs && favorites.length > 0 && filtered.length === 0 && (
+            <div className="empty big">No favorites match “{filter}”.</div>
           )}
 
           <div className="chgrid">
             {filtered.map((s) => {
               const isSel = selected?.stream_id === s.stream_id;
               const onAir = b?.channel?.id === s.stream_id && (live || starting);
+              const fav = isFav(s.stream_id);
               return (
                 <div
                   key={s.stream_id}
                   className={'chcard' + (isSel ? ' sel' : '') + (onAir ? ' onair-card' : '')}
                   onClick={() => setSelected(s)}
                 >
+                  <button
+                    className={'chfav' + (fav ? ' on' : '')}
+                    onClick={(e) => toggleFav(s, e)}
+                    title={fav ? 'Remove from favorites' : 'Add to favorites'}
+                    aria-label={fav ? 'Remove from favorites' : 'Add to favorites'}
+                  >
+                    {fav ? '★' : '☆'}
+                  </button>
                   <div className="chlogo">
                     {s.stream_icon ? (
                       <img src={s.stream_icon} alt="" loading="lazy" onError={(e) => (e.target.style.display = 'none')} />

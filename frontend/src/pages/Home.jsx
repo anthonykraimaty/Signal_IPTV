@@ -28,7 +28,9 @@ export default function Home() {
 
   const b = status?.broadcast;
   const live = b?.status === 'live';
-  const starting = b?.status === 'starting';
+  // Show the warm "tuning in" state both while first starting and while the
+  // server is auto-reconnecting to the same channel after a source drop.
+  const starting = b?.status === 'starting' || b?.status === 'reconnecting';
 
   return (
     <div className="home">

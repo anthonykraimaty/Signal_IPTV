@@ -166,8 +166,8 @@ function spawnFfmpeg(streamUrl) {
     proc = null;
     pushLog(`[ffmpeg] exited code=${code} signal=${signal}`);
     if (intended) {
-      state.status = 'starting';
-      state.error = `Stream interrupted (exit ${code}); reconnecting…`;
+      // scheduleRestart() sets status to 'reconnecting' and keeps retrying the
+      // same channel forever; we never transition to a terminal 'error' here.
       scheduleRestart();
     } else {
       state.status = 'idle';
@@ -180,15 +180,14 @@ function spawnFfmpeg(streamUrl) {
 function scheduleRestart() {
   if (restartTimer || !intended) return;
   restarts += 1;
-  if (restarts > 8 && state.status !== 'live') {
-    pushLog('[broadcast] giving up after repeated failures');
-    intended = null;
-    state.status = 'error';
-    state.error = 'Stream failed repeatedly. Check the channel, credentials, and server CPU.';
-    return;
-  }
-  const delay = Math.min(2000 * restarts, 10000);
-  pushLog(`[broadcast] restart #${restarts} in ${delay}ms`);
+  // Auto-reconnect to the same channel indefinitely — never give up on our own.
+  // Only an explicit stop() (or selecting a new channel) halts the loop, so a
+  // source that drops will self-heal whenever it comes back. Exponential backoff
+  // capped at 30s keeps a persistently-dead source from hammering logs/CPU.
+  state.status = 'reconnecting';
+  state.error = `Reconnecting to "${intended.channel?.name ?? 'channel'}" (attempt ${restarts})…`;
+  const delay = Math.min(2000 * restarts, 30000);
+  pushLog(`[broadcast] reconnect attempt #${restarts} in ${delay}ms`);
   restartTimer = setTimeout(() => {
     restartTimer = null;
     if (intended) launch();
@@ -226,8 +225,12 @@ function watchForLive() {
   }, 1000);
 }
 
-function launch() {
-  cleanMedia();
+function launch({ fresh = false } = {}) {
+  // Only wipe media/ on a brand-new broadcast. On a reconnect we keep the last
+  // segments in place so the player can ride out a brief source drop without
+  // blanking; ffmpeg's delete_segments flag rolls the live window forward once
+  // new segments start flowing.
+  if (fresh) cleanMedia();
   proc = spawnFfmpeg(intended.streamUrl);
   watchForLive();
 }
@@ -241,7 +244,7 @@ export async function start(channel, streamUrl) {
   logBuffer.length = 0;
   state = { status: 'starting', channel, startedAt: Date.now(), error: null };
   pushLog(`[broadcast] starting "${channel.name}" (${streamUrl})`);
-  launch();
+  launch({ fresh: true });
   return getStatus();
 }
 
