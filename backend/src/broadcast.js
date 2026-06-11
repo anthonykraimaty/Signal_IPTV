@@ -7,14 +7,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const MEDIA_DIR = path.join(__dirname, '..', 'media');
 
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
-const X264_PRESET = process.env.X264_PRESET || 'veryfast';
+const X264_PRESET = process.env.X264_PRESET || 'ultrafast';
 const HLS_TIME = process.env.HLS_TIME || '4';
 const HLS_LIST_SIZE = process.env.HLS_LIST_SIZE || '6';
 
 // Adaptive-bitrate ladder, best first. The server holds HD and downscales
 // to give weaker clients something they can sustain without buffering.
+// Trimmed to two rungs (480p/360p) to fit CPU-bound transcoding on a modest
+// VPS — add a 720p rung back here if you have CPU/GPU headroom.
 const LADDER = [
-  { name: '720p', width: 1280, height: 720, vbitrate: '2800k', maxrate: '3000k', bufsize: '4200k', abitrate: '128k' },
   { name: '480p', width: 854, height: 480, vbitrate: '1400k', maxrate: '1500k', bufsize: '2100k', abitrate: '128k' },
   { name: '360p', width: 640, height: 360, vbitrate: '700k', maxrate: '750k', bufsize: '1100k', abitrate: '96k' },
 ];
@@ -40,8 +41,12 @@ function pushLog(line) {
 
 function cleanMedia() {
   try {
-    if (fs.existsSync(MEDIA_DIR)) fs.rmSync(MEDIA_DIR, { recursive: true, force: true });
+    // Empty the directory's CONTENTS rather than removing MEDIA_DIR itself —
+    // in Docker it's a volume mount point and rmdir-ing it fails ("Resource busy").
     fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    for (const entry of fs.readdirSync(MEDIA_DIR)) {
+      fs.rmSync(path.join(MEDIA_DIR, entry), { recursive: true, force: true });
+    }
     LADDER.forEach((_, i) => fs.mkdirSync(path.join(MEDIA_DIR, 'v' + i), { recursive: true }));
   } catch (e) {
     console.error('[broadcast] clean media failed:', e.message);
