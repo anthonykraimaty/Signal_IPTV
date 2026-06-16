@@ -168,6 +168,20 @@ function activeToday(s, now) {
   return s.days.includes(now.getDay()); // weekly
 }
 
+// True if this schedule's START fell on the given calendar day, ignoring the
+// enabled flag. Used for the stop check: a one-time schedule disables itself
+// after firing, but its stop still has to land — possibly on the next day.
+function startedOnDate(s, dayDate, dayDow) {
+  if (s.recurrence === 'once') return s.date === dayDate;
+  return s.days.includes(dayDow); // weekly
+}
+
+// A stop "wraps" past midnight when its time is at/before the start time, so the
+// window ends on the day AFTER the one it started on.
+function stopWrapsMidnight(s) {
+  return timeToMinutes(s.stopTime) <= timeToMinutes(s.startTime);
+}
+
 async function fireStart(s, marker) {
   // Mark first so a slow start doesn't double-fire on the next tick.
   db.prepare('UPDATE schedules SET last_fired = ? WHERE id = ?').run(marker, s.id);
@@ -208,16 +222,27 @@ async function tick() {
   const cur = hhmm(now);
   const startMarker = `${todayDate(now)}T${cur}`;
 
-  for (const s of listSchedules()) {
-    if (!activeToday(s, now)) continue;
+  // Yesterday, for stops that wrap past midnight.
+  const yesterday = new Date(now.getTime() - 86_400_000);
+  const yDate = todayDate(yesterday);
+  const yDow = yesterday.getDay();
 
+  for (const s of listSchedules()) {
     // START at exact minute, once per occurrence (guarded by last_fired marker).
-    if (s.startTime === cur && s.lastFired !== startMarker) {
+    if (activeToday(s, now) && s.startTime === cur && s.lastFired !== startMarker) {
       await fireStart(s, startMarker);
     }
-    // STOP at exact minute (only affects the broadcast if this schedule owns it).
+
+    // STOP at exact minute. Decoupled from activeToday/enabled so it survives the
+    // one-time self-disable, and matched against the day the window OPENED:
+    //   - same-day window (stop > start): the window opened today.
+    //   - cross-midnight window (stop <= start): the window opened yesterday.
+    // fireStop only acts if this schedule still owns the live broadcast.
     if (s.stopTime && s.stopTime === cur) {
-      fireStop(s);
+      const openedDay = stopWrapsMidnight(s)
+        ? startedOnDate(s, yDate, yDow)
+        : startedOnDate(s, todayDate(now), now.getDay());
+      if (openedDay) fireStop(s);
     }
   }
 }
