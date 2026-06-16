@@ -266,18 +266,19 @@ router.post('/broadcast/start', requireRole('control'), async (req, res) => {
     }
     const url = xtream.buildStreamUrl(streamId);
 
-    // Resolve the effective mode. 'copy' (pass-through) only works if the source
-    // is browser-playable (H.264); if the admin asked for copy but the source is
-    // HEVC/other, auto-fall back to transcode so it doesn't black-screen.
-    let effectiveMode = mode === 'copy' ? 'copy' : 'transcode';
+    // Resolve the effective mode. Both 'copy' (pass-through) and 'hybrid' (copy
+    // the source as the top rung + transcode lower rungs) copy the source
+    // untouched, so both need a browser-playable (H.264) source. If the source
+    // is HEVC/other, auto-fall back to full transcode so it doesn't black-screen.
+    let effectiveMode = ['copy', 'hybrid'].includes(mode) ? mode : 'transcode';
     let fallbackNote = null;
-    if (effectiveMode === 'copy') {
+    if (effectiveMode === 'copy' || effectiveMode === 'hybrid') {
       const probe = await probeStream(url);
       if (probe.ok && probe.info && !probe.info.browserPlayable) {
         effectiveMode = 'transcode';
         fallbackNote = `Source is ${probe.info.video?.codec || 'an incompatible codec'} — not browser-playable as-is, transcoding instead.`;
       }
-      // If the probe failed we still honor 'copy' (the source may simply be
+      // If the probe failed we still honor the request (the source may simply be
       // unprobeable here); the player will surface a problem if it can't decode.
     }
 

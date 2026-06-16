@@ -115,9 +115,16 @@ function cleanMedia() {
     for (const entry of fs.readdirSync(MEDIA_DIR)) {
       fs.rmSync(path.join(MEDIA_DIR, entry), { recursive: true, force: true });
     }
-    // One folder per output variant: the ladder rungs when transcoding, or a
-    // single v0 in copy (pass-through) mode.
-    const variants = activeMode === 'copy' ? 1 : activeLadder.length;
+    // One folder per output variant:
+    //  - copy:     1 (the passed-through source)
+    //  - transcode: one per ladder rung
+    //  - hybrid:    the copied source (v0) + one per encoded rung
+    const variants =
+      activeMode === 'copy'
+        ? 1
+        : activeMode === 'hybrid'
+          ? activeLadder.length + 1
+          : activeLadder.length;
     for (let i = 0; i < variants; i++) {
       fs.mkdirSync(path.join(MEDIA_DIR, 'v' + i), { recursive: true });
     }
@@ -177,7 +184,9 @@ function hlsOutputArgs(varStreamMap) {
 }
 
 function buildArgs(streamUrl) {
-  return activeMode === 'copy' ? buildCopyArgs(streamUrl) : buildTranscodeArgs(streamUrl);
+  if (activeMode === 'copy') return buildCopyArgs(streamUrl);
+  if (activeMode === 'hybrid') return buildHybridArgs(streamUrl);
+  return buildTranscodeArgs(streamUrl);
 }
 
 // Pass-through ("as is"): remux the source straight into HLS with NO re-encode.
@@ -246,6 +255,72 @@ function buildTranscodeArgs(streamUrl) {
   );
 
   args.push(...hlsOutputArgs(ladder.map((_, i) => `v:${i},a:${i}`).join(' ')));
+  return args;
+}
+
+// Hybrid: copy the ORIGINAL source untouched as the top rung (zero re-encode →
+// almost no CPU for it), AND transcode the chosen lower rungs (e.g. 480p/360p)
+// for weaker connections. Best of both: full-quality 1080p top with no CPU
+// burden, plus light downscaled fallbacks. Only safe when the source video is
+// browser-playable (H.264); the caller guarantees that via the probe fallback.
+//
+// Output variant order: v0 = copied source, then v1..vN = encoded rungs.
+function buildHybridArgs(streamUrl) {
+  const ladder = activeLadder; // the rungs to ENCODE (top copied rung not included)
+  const n = ladder.length;
+
+  // Decode once, fan the video out into N scaled copies for the encoded rungs.
+  let fc = `[0:v]split=${n}${ladder.map((_, i) => `[v${i}]`).join('')};`;
+  ladder.forEach((r, i) => {
+    fc +=
+      `[v${i}]scale=w=${r.width}:h=${r.height}:force_original_aspect_ratio=decrease,` +
+      `pad=${r.width}:${r.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}out];`;
+  });
+  fc = fc.replace(/;$/, '');
+
+  const args = [...inputArgs(streamUrl), '-filter_complex', fc];
+
+  // --- output 0: the copied source (video + audio passed through) ---
+  args.push(
+    '-map', '0:v:0',
+    '-map', '0:a:0?',
+    '-c:v:0', 'copy',
+    '-c:a:0', 'copy',
+  );
+
+  // --- outputs 1..N: the encoded downscaled rungs ---
+  // Encoder settings MUST be scoped per-output (…:${oi}) here, NOT globally:
+  // a global -profile:v / -g would also hit the copied rung (v0), where they're
+  // invalid for a 'copy' codec and ffmpeg errors out ("Unable to parse option").
+  ladder.forEach((r, i) => {
+    const oi = i + 1; // output index (0 is the copied rung)
+    args.push(
+      '-map', `[v${i}out]`,
+      `-c:v:${oi}`, 'libx264',
+      `-b:v:${oi}`, r.vbitrate,
+      `-maxrate:v:${oi}`, r.maxrate,
+      `-bufsize:v:${oi}`, r.bufsize,
+      `-preset:v:${oi}`, X264_PRESET,
+      `-profile:v:${oi}`, 'main',
+      `-g:v:${oi}`, '48',
+      `-keyint_min:v:${oi}`, '48',
+      `-sc_threshold:v:${oi}`, '0',
+      `-pix_fmt:v:${oi}`, 'yuv420p',
+    );
+  });
+  ladder.forEach((r, i) => {
+    const oi = i + 1;
+    args.push(
+      '-map', 'a:0?',
+      `-c:a:${oi}`, 'aac',
+      `-b:a:${oi}`, r.abitrate,
+      '-ac', '2',
+    );
+  });
+
+  // var_stream_map: v0/a0 = copied source, then the encoded rungs.
+  const map = ['v:0,a:0', ...ladder.map((_, i) => `v:${i + 1},a:${i + 1}`)].join(' ');
+  args.push(...hlsOutputArgs(map));
   return args;
 }
 
@@ -379,7 +454,10 @@ function launch({ fresh = false } = {}) {
 
 // --- public API ---
 
-// opts: { mode: 'transcode' | 'copy', rungs: ['480p','360p', …] }
+// opts: { mode: 'transcode' | 'copy' | 'hybrid', rungs: ['480p','360p', …] }
+//  - transcode: re-encode every rung in `rungs`
+//  - copy:      pass the source through untouched (single quality)
+//  - hybrid:    copy the source as the top rung + transcode the rungs in `rungs`
 export async function start(channel, streamUrl, opts = {}) {
   const hadProc = Boolean(proc);
   stop(); // hard-stop whatever is running (graceful: sends SIGTERM, frees the slot)
@@ -392,7 +470,9 @@ export async function start(channel, streamUrl, opts = {}) {
   }
 
   // Lock in the broadcast mode + ladder for this run.
-  activeMode = opts.mode === 'copy' ? 'copy' : 'transcode';
+  activeMode = ['copy', 'hybrid'].includes(opts.mode) ? opts.mode : 'transcode';
+  // In hybrid the rungs are the ones we ENCODE (below the copied source); if the
+  // caller passes none, fall back to the default downscale ladder.
   activeLadder = resolveRungs(opts.rungs);
 
   intended = { channel, streamUrl, mode: activeMode, rungs: activeLadder.map((r) => r.name) };
@@ -401,10 +481,11 @@ export async function start(channel, streamUrl, opts = {}) {
   sawRejection = false;
   logBuffer.length = 0;
   state = { status: 'starting', channel, startedAt: Date.now(), error: null };
-  const desc =
-    activeMode === 'copy'
-      ? 'pass-through (as-is, no re-encode)'
-      : `transcode → ${activeLadder.map((r) => r.name).join(' / ')}`;
+  let desc;
+  if (activeMode === 'copy') desc = 'pass-through (as-is, no re-encode)';
+  else if (activeMode === 'hybrid')
+    desc = `hybrid → source as-is + transcode ${activeLadder.map((r) => r.name).join(' / ')}`;
+  else desc = `transcode → ${activeLadder.map((r) => r.name).join(' / ')}`;
   pushLog(`[broadcast] starting "${channel.name}" [${desc}] (${streamUrl})`);
   launch({ fresh: true });
   return getStatus();
@@ -440,11 +521,17 @@ export function getStatus() {
     startedAt: state.startedAt,
     error: state.error,
     masterUrl: '/media/master.m3u8',
-    mode: activeMode, // 'transcode' | 'copy'
+    mode: activeMode, // 'transcode' | 'copy' | 'hybrid'
     ladder:
       activeMode === 'copy'
         ? [] // pass-through has no ABR ladder
-        : activeLadder.map((r) => ({ name: r.name, height: r.height, vbitrate: r.vbitrate })),
+        : activeMode === 'hybrid'
+          ? // copied source on top + the encoded rungs below
+            [
+              { name: 'source', height: null, vbitrate: 'as-is' },
+              ...activeLadder.map((r) => ({ name: r.name, height: r.height, vbitrate: r.vbitrate })),
+            ]
+          : activeLadder.map((r) => ({ name: r.name, height: r.height, vbitrate: r.vbitrate })),
   };
 }
 

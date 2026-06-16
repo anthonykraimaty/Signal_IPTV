@@ -38,8 +38,10 @@ export default function Admin() {
 
   const [favorites, setFavorites] = useState([]); // [{streamId, name, icon, categoryId}]
 
-  // Broadcast mode: pass-through ("as is") vs transcode down to chosen rungs.
-  const [bcMode, setBcMode] = useState('transcode'); // 'transcode' | 'copy'
+  // Broadcast mode: 'hybrid' (source as-is + downscale rungs), 'transcode'
+  // (re-encode all rungs), or 'copy' (pass-through only). Hybrid is the default:
+  // full-quality top with almost no CPU, plus fallbacks for weak connections.
+  const [bcMode, setBcMode] = useState('hybrid');
   const [rungCatalog, setRungCatalog] = useState([]); // [{name,height,width,vbitrate}]
   const [pickedRungs, setPickedRungs] = useState(['480p', '360p']);
 
@@ -365,11 +367,30 @@ export default function Admin() {
           <section className="panel">
             <div className="panel-head">
               <h2>Broadcast mode</h2>
-              <span className={'chip ' + (bcMode === 'copy' ? 'chip-wait' : 'chip-ok')}>
-                {bcMode === 'copy' ? 'as-is' : 'transcode'}
+              <span
+                className={
+                  'chip ' + (bcMode === 'copy' ? 'chip-wait' : bcMode === 'hybrid' ? 'chip-ok' : 'chip-ok')
+                }
+              >
+                {bcMode === 'copy' ? 'as-is' : bcMode === 'hybrid' ? 'hybrid' : 'transcode'}
               </span>
             </div>
             <div className="bcmode">
+              <label className="bcmode-opt">
+                <input
+                  type="radio"
+                  name="bcmode"
+                  checked={bcMode === 'hybrid'}
+                  onChange={() => setBcMode('hybrid')}
+                />
+                <span>
+                  <strong>Source as-is + downscale</strong>
+                  <small>
+                    Pass the original through untouched (top quality, ~no CPU) AND
+                    add the lower rungs below for weak connections.
+                  </small>
+                </span>
+              </label>
               <label className="bcmode-opt">
                 <input
                   type="radio"
@@ -379,7 +400,7 @@ export default function Admin() {
                 />
                 <span>
                   <strong>Compress down</strong>
-                  <small>Re-encode to the rungs below (adaptive quality).</small>
+                  <small>Re-encode every rung below (no full-quality top; more CPU).</small>
                 </span>
               </label>
               <label className="bcmode-opt">
@@ -390,17 +411,19 @@ export default function Admin() {
                   onChange={() => setBcMode('copy')}
                 />
                 <span>
-                  <strong>Broadcast as-is</strong>
+                  <strong>Broadcast as-is only</strong>
                   <small>
-                    Pass through, no re-encode (lowest CPU, single quality).
+                    Pass through, no re-encode (lowest CPU, single quality, no fallback).
                     HEVC sources auto-transcode.
                   </small>
                 </span>
               </label>
 
-              {bcMode === 'transcode' && (
+              {(bcMode === 'transcode' || bcMode === 'hybrid') && (
                 <div className="bcmode-rungs">
-                  <span className="bcmode-rungs-label">Resolutions</span>
+                  <span className="bcmode-rungs-label">
+                    {bcMode === 'hybrid' ? 'Downscale rungs (below source)' : 'Resolutions'}
+                  </span>
                   <div className="rung-grid">
                     {rungCatalog.map((r) => {
                       const on = pickedRungs.includes(r.name);
@@ -550,11 +573,18 @@ export default function Admin() {
                         e.stopPropagation();
                         goLive(s);
                       }}
-                      disabled={busy || (bcMode === 'transcode' && pickedRungs.length === 0)}
+                      disabled={
+                        busy ||
+                        ((bcMode === 'transcode' || bcMode === 'hybrid') && pickedRungs.length === 0)
+                      }
                       title={
-                        bcMode === 'transcode' && pickedRungs.length === 0
+                        (bcMode === 'transcode' || bcMode === 'hybrid') && pickedRungs.length === 0
                           ? 'Pick at least one resolution'
-                          : `Go live (${bcMode === 'copy' ? 'as-is' : pickedRungs.join('/')})`
+                          : bcMode === 'copy'
+                            ? 'Go live (as-is)'
+                            : bcMode === 'hybrid'
+                              ? `Go live (source + ${pickedRungs.join('/')})`
+                              : `Go live (${pickedRungs.join('/')})`
                       }
                     >
                       ▶ Go live
