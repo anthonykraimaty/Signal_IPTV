@@ -29,12 +29,13 @@ const RUNG_CATALOG = {
 const DEFAULT_RUNGS = ['480p', '360p']; // matches the previous hard-coded ladder
 
 // Resolve a requested rung list (e.g. ['720p','480p']) to catalog entries,
-// best-first, ignoring unknown names; falls back to the default ladder if empty.
+// best-first, ignoring unknown names. Returns [] for an empty/unknown request —
+// the caller decides whether empty is valid (it is for hybrid = pure copy; for
+// transcode the caller falls back to the default ladder).
 function resolveRungs(names) {
   const order = Object.keys(RUNG_CATALOG); // already best→worst
-  const want = new Set((names && names.length ? names : DEFAULT_RUNGS).map(String));
-  const picked = order.filter((k) => want.has(k)).map((k) => RUNG_CATALOG[k]);
-  return picked.length ? picked : DEFAULT_RUNGS.map((k) => RUNG_CATALOG[k]);
+  const want = new Set((names || []).map(String));
+  return order.filter((k) => want.has(k)).map((k) => RUNG_CATALOG[k]);
 }
 
 // Latency/buffer presets, chosen per broadcast from the Control Room. Smaller
@@ -521,15 +522,44 @@ function watchForLive() {
 }
 
 function launch({ fresh = false } = {}) {
-  // Only wipe media/ on a brand-new broadcast. On a reconnect we keep the last
-  // segments in place so the player can ride out a brief source drop without
-  // blanking; ffmpeg's delete_segments flag rolls the live window forward once
-  // new segments start flowing.
-  if (fresh) cleanMedia();
+  // Only wipe media/ on a brand-new broadcast. On a reconnect / seamless
+  // re-launch we keep the last segments in place so the player can ride out the
+  // brief gap without blanking; ffmpeg's delete_segments flag rolls the live
+  // window forward once new segments start flowing.
+  if (fresh) {
+    cleanMedia();
+  } else {
+    // A seamless re-launch may use a different ladder than what's on disk. Keep
+    // the current variant folders (the player is mid-playback in them) but prune
+    // any *extra* folders from a larger previous ladder so the player doesn't
+    // keep polling a phantom variant that will never update again.
+    pruneStaleVariants();
+  }
   sawRejection = false; // fresh per-run flag; set by stderr scanning if rejected
   noisyCount = 0; // reset suppressed-noise counter per (re)launch
   proc = spawnFfmpeg(intended.streamUrl);
   watchForLive();
+}
+
+// Remove variant folders beyond the count this run will produce. Leaves the
+// in-use folders (and their segments) untouched for seamless playback.
+function pruneStaleVariants() {
+  const keep =
+    activeMode === 'copy'
+      ? 1
+      : activeMode === 'hybrid'
+        ? activeLadder.length + 1
+        : activeLadder.length;
+  try {
+    for (const entry of fs.readdirSync(MEDIA_DIR)) {
+      const m = /^v(\d+)$/.exec(entry);
+      if (m && Number(m[1]) >= keep) {
+        fs.rmSync(path.join(MEDIA_DIR, entry), { recursive: true, force: true });
+      }
+    }
+  } catch (e) {
+    console.error('[broadcast] prune stale variants failed:', e.message);
+  }
 }
 
 // --- public API ---
@@ -541,6 +571,10 @@ function launch({ fresh = false } = {}) {
 //  - buffer:    HLS segment length / live window (latency vs resilience)
 export async function start(channel, streamUrl, opts = {}) {
   const hadProc = Boolean(proc);
+  // Re-launching the SAME channel (e.g. changing the ladder/buffer live) → keep
+  // the existing HLS segments so the player rides through the brief restart from
+  // its buffer instead of going black. A different channel wipes media as usual.
+  const sameChannel = intended && intended.channel?.id === channel.id;
   stop(); // hard-stop whatever is running (graceful: sends SIGTERM, frees the slot)
   // On a max_connections=1 line we must not open the new connection while the
   // old one is still closing, or the server rejects us for exceeding the limit.
@@ -552,9 +586,16 @@ export async function start(channel, streamUrl, opts = {}) {
 
   // Lock in the broadcast mode + ladder + buffer preset for this run.
   activeMode = ['copy', 'hybrid'].includes(opts.mode) ? opts.mode : 'transcode';
-  // In hybrid the rungs are the ones we ENCODE (below the copied source); if the
-  // caller passes none, fall back to the default downscale ladder.
   activeLadder = resolveRungs(opts.rungs);
+  // Mode-aware handling of an empty ladder:
+  //  - hybrid with no downscale rungs = just the copied source → collapse to
+  //    'copy' (identical output, simplest pipeline, zero encoding CPU).
+  //  - transcode needs at least one rung to encode → fall back to the default.
+  if (activeMode === 'hybrid' && activeLadder.length === 0) {
+    activeMode = 'copy';
+  } else if (activeMode === 'transcode' && activeLadder.length === 0) {
+    activeLadder = DEFAULT_RUNGS.map((k) => RUNG_CATALOG[k]);
+  }
   activeBuffer = resolveBuffer(opts.buffer);
 
   intended = {
@@ -575,8 +616,11 @@ export async function start(channel, streamUrl, opts = {}) {
     desc = `hybrid → source as-is + transcode ${activeLadder.map((r) => r.name).join(' / ')}`;
   else desc = `transcode → ${activeLadder.map((r) => r.name).join(' / ')}`;
   desc += ` · ${activeBuffer.label} buffer (${activeBuffer.hlsTime}s segs)`;
+  if (sameChannel) desc += ' · seamless re-launch (kept buffer)';
   pushLog(`[broadcast] starting "${channel.name}" [${desc}] (${streamUrl})`);
-  launch({ fresh: true });
+  // Same channel → keep the buffered segments so the player doesn't blank while
+  // ffmpeg restarts with the new ladder. Different channel → fresh wipe.
+  launch({ fresh: !sameChannel });
   return getStatus();
 }
 

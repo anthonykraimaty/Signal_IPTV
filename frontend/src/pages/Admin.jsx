@@ -473,7 +473,7 @@ export default function Admin() {
               {(bcMode === 'transcode' || bcMode === 'hybrid') && (
                 <div className="bcmode-rungs">
                   <span className="bcmode-rungs-label">
-                    {bcMode === 'hybrid' ? 'Downscale rungs (below source)' : 'Resolutions'}
+                    {bcMode === 'hybrid' ? 'Downscale rungs (optional)' : 'Resolutions'}
                   </span>
                   <div className="rung-grid">
                     {rungCatalog.map((r) => {
@@ -491,8 +491,16 @@ export default function Admin() {
                       );
                     })}
                   </div>
-                  {pickedRungs.length === 0 && (
+                  {/* Transcode must encode something; hybrid is fine with none
+                      (= just pass the source through, zero CPU). */}
+                  {bcMode === 'transcode' && pickedRungs.length === 0 && (
                     <div className="bcmode-warn">Pick at least one resolution.</div>
+                  )}
+                  {bcMode === 'hybrid' && pickedRungs.length === 0 && (
+                    <div className="bcmode-hint">
+                      None selected → source passes through untouched (no CPU). Add rungs only if
+                      weak connections need a fallback.
+                    </div>
                   )}
                 </div>
               )}
@@ -523,11 +531,8 @@ export default function Admin() {
                     type="button"
                     className="btn btn-ghost btn-sm"
                     onClick={relaunchLive}
-                    disabled={
-                      busy ||
-                      ((bcMode === 'transcode' || bcMode === 'hybrid') && pickedRungs.length === 0)
-                    }
-                    title={`Re-launch "${b?.channel?.name}" with these settings`}
+                    disabled={busy || (bcMode === 'transcode' && pickedRungs.length === 0)}
+                    title={`Re-launch "${b?.channel?.name}" with these settings (keeps playing — no black screen)`}
                   >
                     ↻ Apply now
                   </button>
@@ -661,17 +666,14 @@ export default function Admin() {
                         e.stopPropagation();
                         goLive(s);
                       }}
-                      disabled={
-                        busy ||
-                        ((bcMode === 'transcode' || bcMode === 'hybrid') && pickedRungs.length === 0)
-                      }
+                      disabled={busy || (bcMode === 'transcode' && pickedRungs.length === 0)}
                       title={
-                        (bcMode === 'transcode' || bcMode === 'hybrid') && pickedRungs.length === 0
+                        bcMode === 'transcode' && pickedRungs.length === 0
                           ? 'Pick at least one resolution'
                           : bcMode === 'copy'
                             ? 'Go live (as-is)'
                             : bcMode === 'hybrid'
-                              ? `Go live (source + ${pickedRungs.join('/')})`
+                              ? `Go live (source${pickedRungs.length ? ' + ' + pickedRungs.join('/') : ' only'})`
                               : `Go live (${pickedRungs.join('/')})`
                       }
                     >
