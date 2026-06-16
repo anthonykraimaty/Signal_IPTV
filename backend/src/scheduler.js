@@ -50,14 +50,38 @@ function rowToSchedule(r) {
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+// "HH:MM" -> minutes since midnight; minutes -> "HH:MM" (wrapping past midnight).
+function timeToMinutes(t) {
+  const [h, m] = t.split(':').map(Number);
+  return h * 60 + m;
+}
+function minutesToTime(mins) {
+  const wrapped = ((mins % 1440) + 1440) % 1440;
+  return `${pad(Math.floor(wrapped / 60))}:${pad(wrapped % 60)}`;
+}
+
+// A stop can be given as an explicit stopTime OR as a durationMinutes added to the
+// start. Either way the DB stores a single canonical stop_time ("HH:MM" or NULL).
+function resolveStopTime(startTime, input) {
+  if (input.stopTime) {
+    if (!TIME_RE.test(input.stopTime)) throw new Error('Stop time must be HH:MM (24h) or empty');
+    return input.stopTime;
+  }
+  if (input.durationMinutes === undefined || input.durationMinutes === null || input.durationMinutes === '') {
+    return null; // open-ended
+  }
+  const dur = Number(input.durationMinutes);
+  if (!Number.isInteger(dur) || dur <= 0) throw new Error('Duration must be a whole number of minutes (> 0)');
+  if (dur >= 1440) throw new Error('Duration must be under 24 hours');
+  return minutesToTime(timeToMinutes(startTime) + dur);
+}
+
 function validate(input) {
   const streamId = Number(input.streamId);
   if (!Number.isInteger(streamId)) throw new Error('A channel (streamId) is required');
   if (!input.name) throw new Error('Channel name is required');
   if (!TIME_RE.test(input.startTime || '')) throw new Error('Start time must be HH:MM (24h)');
-  if (input.stopTime && !TIME_RE.test(input.stopTime)) {
-    throw new Error('Stop time must be HH:MM (24h) or empty');
-  }
+  const stopTime = resolveStopTime(input.startTime, input);
   const recurrence = input.recurrence === 'weekly' ? 'weekly' : 'once';
   let date = null;
   let days = null;
@@ -76,7 +100,7 @@ function validate(input) {
     name: String(input.name),
     icon: input.icon ? String(input.icon) : null,
     startTime: input.startTime,
-    stopTime: input.stopTime || null,
+    stopTime,
     recurrence,
     date,
     days,

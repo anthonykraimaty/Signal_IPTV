@@ -17,7 +17,9 @@ const EMPTY = {
   name: '',
   icon: '',
   startTime: '20:00',
+  endMode: 'time', // 'time' | 'duration'
   stopTime: '',
+  durationMinutes: '', // minutes, used when endMode === 'duration'
   recurrence: 'once',
   date: '',
   days: [],
@@ -26,6 +28,19 @@ const EMPTY = {
 function fmtDays(days) {
   if (!days?.length) return '';
   return WEEKDAYS.filter((d) => days.includes(d.n)).map((d) => d.label).join(' ');
+}
+
+// Project "start + N minutes" to a readable "at HH:MM" hint (wraps past midnight).
+function durationLabel(startTime, minutes) {
+  const mins = Number(minutes);
+  if (!/^\d{1,2}:\d{2}$/.test(startTime || '') || !Number.isFinite(mins) || mins <= 0) {
+    return 'after the chosen number of minutes';
+  }
+  const [h, m] = startTime.split(':').map(Number);
+  const total = ((h * 60 + m + mins) % 1440 + 1440) % 1440;
+  const hh = String(Math.floor(total / 60)).padStart(2, '0');
+  const mm = String(total % 60).padStart(2, '0');
+  return `at ${hh}:${mm}`;
 }
 
 function describe(s) {
@@ -104,7 +119,9 @@ export default function Schedules() {
       name: s.name,
       icon: s.icon || '',
       startTime: s.startTime,
+      endMode: 'time',
       stopTime: s.stopTime || '',
+      durationMinutes: '',
       recurrence: s.recurrence,
       date: s.date || '',
       days: s.days || [],
@@ -121,7 +138,12 @@ export default function Schedules() {
       name: form.name,
       icon: form.icon || null,
       startTime: form.startTime,
-      stopTime: form.stopTime || null,
+      // End is sent one way or the other; the backend resolves both to a stop time.
+      stopTime: form.endMode === 'time' ? form.stopTime || null : null,
+      durationMinutes:
+        form.endMode === 'duration' && form.durationMinutes !== ''
+          ? Number(form.durationMinutes)
+          : null,
       recurrence: form.recurrence,
       date: form.recurrence === 'once' ? form.date : null,
       days: form.recurrence === 'weekly' ? form.days : [],
@@ -232,14 +254,42 @@ export default function Schedules() {
                 />
               </label>
               <label className="field">
+                <span>Ends by</span>
+                <select
+                  value={form.endMode}
+                  onChange={(e) => setForm({ ...form, endMode: e.target.value })}
+                >
+                  <option value="time">Stop time</option>
+                  <option value="duration">Duration</option>
+                </select>
+              </label>
+            </div>
+
+            {form.endMode === 'time' ? (
+              <label className="field">
                 <span>Stop time (optional)</span>
                 <input
                   type="time"
                   value={form.stopTime}
                   onChange={(e) => setForm({ ...form, stopTime: e.target.value })}
                 />
+                <small className="muted">Leave empty to keep the channel open-ended.</small>
               </label>
-            </div>
+            ) : (
+              <label className="field">
+                <span>Duration (minutes)</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="1439"
+                  step="1"
+                  value={form.durationMinutes}
+                  onChange={(e) => setForm({ ...form, durationMinutes: e.target.value })}
+                  placeholder="e.g. 90"
+                />
+                <small className="muted">Stops {form.durationMinutes ? durationLabel(form.startTime, form.durationMinutes) : 'after the chosen number of minutes'}.</small>
+              </label>
+            )}
 
             <label className="field">
               <span>Repeat</span>
