@@ -107,7 +107,7 @@ export async function getBroadcastModes() {
   const d = await fetch('/api/broadcast/modes', opts()).then((r) =>
     asJson(r, 'Failed to load broadcast modes'),
   );
-  return d.rungs;
+  return { rungs: d.rungs, buffers: d.buffers || [] };
 }
 export async function probeChannel(streamId, withBitrate = false) {
   const q = withBitrate ? '?bitrate=1' : '';

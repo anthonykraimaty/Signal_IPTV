@@ -249,10 +249,10 @@ router.get('/channels/:id/probe', requireRole('control'), async (req, res) => {
 //  Broadcast control  (control+)
 // ============================================================
 
-// Expose the available transcode rungs so the broadcast-mode panel can render
-// a checkbox per rung.
+// Expose the available transcode rungs + latency presets so the Control Room
+// can render the broadcast-mode panel.
 router.get('/broadcast/modes', requireRole('control'), (req, res) => {
-  res.json({ rungs: broadcast.getRungCatalog() });
+  res.json({ rungs: broadcast.getRungCatalog(), buffers: broadcast.getBufferPresets() });
 });
 
 router.post('/broadcast/start', requireRole('control'), async (req, res) => {
@@ -260,7 +260,7 @@ router.post('/broadcast/start', requireRole('control'), async (req, res) => {
     if (!isConfigured()) {
       return res.status(400).json({ error: 'Configure Xtream credentials first' });
     }
-    const { streamId, name, icon, mode, rungs } = req.body || {};
+    const { streamId, name, icon, mode, rungs, buffer } = req.body || {};
     if (!streamId && streamId !== 0) {
       return res.status(400).json({ error: 'streamId is required' });
     }
@@ -285,7 +285,7 @@ router.post('/broadcast/start', requireRole('control'), async (req, res) => {
     const status = await broadcast.start(
       { id: streamId, name: name || `Channel ${streamId}`, icon: icon || null },
       url,
-      { mode: effectiveMode, rungs },
+      { mode: effectiveMode, rungs, buffer },
     );
     res.json({ ok: true, broadcast: status, fallbackNote });
   } catch (e) {

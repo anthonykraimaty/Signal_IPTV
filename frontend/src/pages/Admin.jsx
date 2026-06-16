@@ -64,9 +64,14 @@ export default function Admin() {
   const [rungCatalog, setRungCatalog] = useState([]); // [{name,height,width,vbitrate}]
   const [pickedRungs, setPickedRungs] = useState(() => loadPref('pickedRungs', ['480p', '360p']));
 
+  // Latency/buffer preset: 'low' | 'balanced' | 'safe' (closer-to-live vs smoother).
+  const [bufferPresets, setBufferPresets] = useState([]); // [{name,label,hlsTime,approxLatency}]
+  const [bcBuffer, setBcBuffer] = useState(() => loadPref('bcBuffer', 'balanced'));
+
   // Persist broadcast-mode prefs whenever they change.
   useEffect(() => savePref('bcMode', bcMode), [bcMode]);
   useEffect(() => savePref('pickedRungs', pickedRungs), [pickedRungs]);
+  useEffect(() => savePref('bcBuffer', bcBuffer), [bcBuffer]);
 
   // Channel info from ffprobe, keyed by streamId: { loading, info, error }.
   const [chInfo, setChInfo] = useState({});
@@ -94,7 +99,10 @@ export default function Admin() {
     loadFavorites();
     refreshStatus();
     getBroadcastModes()
-      .then((rungs) => setRungCatalog(rungs))
+      .then(({ rungs, buffers }) => {
+        setRungCatalog(rungs);
+        setBufferPresets(buffers);
+      })
       .catch(() => {});
     const id = setInterval(refreshStatus, 4000);
     return () => clearInterval(id);
@@ -245,6 +253,7 @@ export default function Admin() {
         icon: stream.stream_icon ?? stream.icon,
         mode,
         rungs: mode === 'copy' ? [] : pickedRungs,
+        buffer: bcBuffer,
       });
       if (res?.fallbackNote) setNote(res.fallbackNote);
       await refreshStatus();
@@ -279,12 +288,15 @@ export default function Admin() {
   // The mode/rungs actually running, vs. what the picker now shows. Used to nudge
   // the user that a live change won't take effect until the channel is relaunched.
   const liveMode = b?.mode || null;
+  const liveBuffer = b?.buffer || null;
   // For hybrid the status ladder is ['source', …encoded rungs]; strip 'source'.
   const liveRungs = (b?.ladder || []).map((r) => r.name).filter((n) => n !== 'source');
   const wantRungs = bcMode === 'copy' ? [] : pickedRungs;
   const sameSet = (a, c) => a.length === c.length && [...a].sort().join() === [...c].sort().join();
   const settingsDiffer =
-    (live || starting) && b?.channel && (liveMode !== bcMode || !sameSet(liveRungs, wantRungs));
+    (live || starting) &&
+    b?.channel &&
+    (liveMode !== bcMode || liveBuffer !== bcBuffer || !sameSet(liveRungs, wantRungs));
 
   // Re-launch the currently-live channel with the picker's current settings.
   async function relaunchLive() {
@@ -482,6 +494,25 @@ export default function Admin() {
                   {pickedRungs.length === 0 && (
                     <div className="bcmode-warn">Pick at least one resolution.</div>
                   )}
+                </div>
+              )}
+
+              {bufferPresets.length > 0 && (
+                <div className="bcmode-rungs">
+                  <span className="bcmode-rungs-label">Latency / buffer</span>
+                  <div className="rung-grid">
+                    {bufferPresets.map((p) => (
+                      <button
+                        key={p.name}
+                        type="button"
+                        className={'rung-chip' + (bcBuffer === p.name ? ' on' : '')}
+                        onClick={() => setBcBuffer(p.name)}
+                        title={`~${p.approxLatency}s behind live · ${p.hlsTime}s segments`}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
 

@@ -37,11 +37,38 @@ function resolveRungs(names) {
   return picked.length ? picked : DEFAULT_RUNGS.map((k) => RUNG_CATALOG[k]);
 }
 
+// Latency/buffer presets, chosen per broadcast from the Control Room. Smaller
+// segments + a shorter window = closer to live but more sensitive to a shaky
+// source/CPU (more rebuffering). hls_time is the segment length; list_size is how
+// many segments the live playlist keeps. Rough latency ≈ hls_time × 3.
+const BUFFER_PRESETS = {
+  low: { name: 'low', label: 'Low latency', hlsTime: '2', listSize: '6' }, // ~6s behind
+  balanced: { name: 'balanced', label: 'Balanced', hlsTime: '4', listSize: '6' }, // ~12s
+  safe: { name: 'safe', label: 'Safe', hlsTime: '6', listSize: '8' }, // ~18s, most resilient
+};
+// Default honors the env override if set, else 'balanced'.
+const DEFAULT_BUFFER =
+  Object.values(BUFFER_PRESETS).find((p) => p.hlsTime === HLS_TIME && p.listSize === HLS_LIST_SIZE) ||
+  BUFFER_PRESETS.balanced;
+
+function resolveBuffer(name) {
+  return BUFFER_PRESETS[name] || DEFAULT_BUFFER;
+}
+
+// Keyframe interval (GOP) in frames, aligned to the active segment length so a
+// keyframe lands exactly on each segment boundary. Misaligned GOPs force ffmpeg
+// to emit extra keyframes (wasted CPU + larger segments) and can break clean
+// rung-switching. = output fps × segment seconds.
+function gopFrames() {
+  return String(Math.max(1, Math.round(Number(FPS) * Number(activeBuffer.hlsTime))));
+}
+
 // The broadcast mode in effect for the *current* run. 'transcode' builds the
 // HLS ABR ladder (re-encodes); 'copy' is pass-through (no re-encode, single
-// quality). Set per launch from `intended.mode` / `intended.rungs`.
+// quality). Set per launch from `intended.mode` / `intended.rungs` / buffer.
 let activeLadder = DEFAULT_RUNGS.map((k) => RUNG_CATALOG[k]);
 let activeMode = 'transcode';
+let activeBuffer = DEFAULT_BUFFER;
 
 let state = {
   status: 'idle', // idle | starting | live | error
@@ -84,6 +111,11 @@ const KILL_GRACE = 4000; // wait this long for a clean exit before SIGKILL
 // to a transient/network failure. Matched case-insensitively.
 const REJECTION_RE =
   /\b(401|403|429|503|509)\b|forbidden|unauthorized|too many requests|server returned 4\d\d|service unavailable|connection limit|max.*connection/i;
+
+// High-volume, benign ffmpeg chatter from copying an unstable IPTV TS feed.
+// Coalesced into a periodic summary so it doesn't drown the log buffer.
+const NOISE_RE = /non-monotonic dts|queue input is backward in time|past duration .* too large/i;
+let noisyCount = 0; // running count of suppressed noisy lines
 
 // Symmetric jitter: returns ms in [base*0.7, base*1.3], so retries never land
 // on an exact grid (deterministic clockwork reconnects are easy to fingerprint
@@ -178,8 +210,8 @@ function inputArgs(streamUrl) {
 function hlsOutputArgs(varStreamMap) {
   return [
     '-f', 'hls',
-    '-hls_time', HLS_TIME,
-    '-hls_list_size', HLS_LIST_SIZE,
+    '-hls_time', activeBuffer.hlsTime,
+    '-hls_list_size', activeBuffer.listSize,
     '-hls_flags', 'independent_segments+delete_segments+omit_endlist',
     '-hls_segment_type', 'mpegts',
     '-hls_segment_filename', 'v%v/seg_%05d.ts',
@@ -205,10 +237,12 @@ function buildCopyArgs(streamUrl) {
     '-map', '0:v:0',
     '-map', '0:a:0?',
     '-c', 'copy',
-    // Keep timestamps sane when copying a live MPEG-TS into HLS.
-    '-copyts',
-    '-muxpreload', '0',
-    '-muxdelay', '0',
+    // IPTV TS feeds have non-monotonic timestamps (PCR resets, ad splices, feed
+    // switches). Do NOT use -copyts: preserving the broken source timestamps
+    // makes ffmpeg clamp every backwards-jumping packet and flood the log with
+    // "Non-monotonic DTS". Instead let HLS regenerate clean output timestamps.
+    '-fflags', '+genpts',
+    '-avoid_negative_ts', 'make_zero',
     ...hlsOutputArgs('v:0,a:0'),
   ];
 }
@@ -268,11 +302,12 @@ function buildTranscodeArgs(streamUrl) {
   // filter above, ffmpeg duplicates/drops frames across a source discontinuity
   // rather than emitting a gap, so the HLS segment stays whole and the player's
   // buffer doesn't drain. -muxpreload/-muxdelay 0 keeps live latency low.
+  const gop = gopFrames();
   args.push(
     '-preset', X264_PRESET,
     '-profile:v', 'main',
-    '-g', '48',
-    '-keyint_min', '48',
+    '-g', gop,
+    '-keyint_min', gop,
     '-sc_threshold', '0',
     '-pix_fmt', 'yuv420p',
     '-fps_mode', 'cfr',
@@ -307,17 +342,26 @@ function buildHybridArgs(streamUrl) {
   const args = [...inputArgs(streamUrl), '-filter_complex', fc];
 
   // --- output 0: the copied source (video + audio passed through) ---
+  // The copied rung can't be re-stamped (no decoded frames), so it inherits the
+  // source's non-monotonic TS. We can't fully repair that without decoding (which
+  // would defeat the point of copying), but -avoid_negative_ts make_zero +genpts
+  // lets the HLS muxer rebase the output timeline so segments stay playable and
+  // ffmpeg stops clamping/log-flooding every backwards packet. A true source
+  // discontinuity may still cause a brief blip on this rung — clients on a weak
+  // link fall back to the transcoded rungs, which ARE fully re-stamped.
   args.push(
     '-map', '0:v:0',
     '-map', '0:a:0?',
     '-c:v:0', 'copy',
     '-c:a:0', 'copy',
+    '-avoid_negative_ts', 'make_zero',
   );
 
   // --- outputs 1..N: the encoded downscaled rungs ---
   // Encoder settings MUST be scoped per-output (…:${oi}) here, NOT globally:
   // a global -profile:v / -g would also hit the copied rung (v0), where they're
   // invalid for a 'copy' codec and ffmpeg errors out ("Unable to parse option").
+  const gop = gopFrames();
   ladder.forEach((r, i) => {
     const oi = i + 1; // output index (0 is the copied rung)
     args.push(
@@ -328,8 +372,8 @@ function buildHybridArgs(streamUrl) {
       `-bufsize:v:${oi}`, r.bufsize,
       `-preset:v:${oi}`, X264_PRESET,
       `-profile:v:${oi}`, 'main',
-      `-g:v:${oi}`, '48',
-      `-keyint_min:v:${oi}`, '48',
+      `-g:v:${oi}`, gop,
+      `-keyint_min:v:${oi}`, gop,
       `-sc_threshold:v:${oi}`, '0',
       `-pix_fmt:v:${oi}`, 'yuv420p',
     );
@@ -360,10 +404,19 @@ function spawnFfmpeg(streamUrl) {
     String(d).split(/\r?\n/).forEach((ln) => {
       const t = ln.trim();
       if (!t) return;
-      pushLog('[ffmpeg] ' + t);
-      // Flag if the source actively rejected this connection. Only meaningful
-      // for the current process; superseded ones are ignored on exit anyway.
+      // Flag rejections BEFORE any filtering so we never miss one.
       if (proc === child && REJECTION_RE.test(t)) sawRejection = true;
+      // The copied rung floods "Non-monotonic DTS" on unstable IPTV feeds — it's
+      // expected and benign (we rebase via -avoid_negative_ts). Coalesce it into
+      // a single periodic line instead of letting it bury the 80-line buffer.
+      if (NOISE_RE.test(t)) {
+        noisyCount += 1;
+        if (noisyCount % 200 === 1) {
+          pushLog(`[ffmpeg] (source timestamp jitter — ${noisyCount} msgs suppressed)`);
+        }
+        return;
+      }
+      pushLog('[ffmpeg] ' + t);
     });
   });
   child.stdout.on('data', () => {});
@@ -474,16 +527,18 @@ function launch({ fresh = false } = {}) {
   // new segments start flowing.
   if (fresh) cleanMedia();
   sawRejection = false; // fresh per-run flag; set by stderr scanning if rejected
+  noisyCount = 0; // reset suppressed-noise counter per (re)launch
   proc = spawnFfmpeg(intended.streamUrl);
   watchForLive();
 }
 
 // --- public API ---
 
-// opts: { mode: 'transcode' | 'copy' | 'hybrid', rungs: ['480p','360p', …] }
+// opts: { mode, rungs: ['480p','360p', …], buffer: 'low'|'balanced'|'safe' }
 //  - transcode: re-encode every rung in `rungs`
 //  - copy:      pass the source through untouched (single quality)
 //  - hybrid:    copy the source as the top rung + transcode the rungs in `rungs`
+//  - buffer:    HLS segment length / live window (latency vs resilience)
 export async function start(channel, streamUrl, opts = {}) {
   const hadProc = Boolean(proc);
   stop(); // hard-stop whatever is running (graceful: sends SIGTERM, frees the slot)
@@ -495,13 +550,20 @@ export async function start(channel, streamUrl, opts = {}) {
     await waitForSlotRelease();
   }
 
-  // Lock in the broadcast mode + ladder for this run.
+  // Lock in the broadcast mode + ladder + buffer preset for this run.
   activeMode = ['copy', 'hybrid'].includes(opts.mode) ? opts.mode : 'transcode';
   // In hybrid the rungs are the ones we ENCODE (below the copied source); if the
   // caller passes none, fall back to the default downscale ladder.
   activeLadder = resolveRungs(opts.rungs);
+  activeBuffer = resolveBuffer(opts.buffer);
 
-  intended = { channel, streamUrl, mode: activeMode, rungs: activeLadder.map((r) => r.name) };
+  intended = {
+    channel,
+    streamUrl,
+    mode: activeMode,
+    rungs: activeLadder.map((r) => r.name),
+    buffer: activeBuffer.name,
+  };
   restarts = 0;
   rejections = 0;
   sawRejection = false;
@@ -512,6 +574,7 @@ export async function start(channel, streamUrl, opts = {}) {
   else if (activeMode === 'hybrid')
     desc = `hybrid → source as-is + transcode ${activeLadder.map((r) => r.name).join(' / ')}`;
   else desc = `transcode → ${activeLadder.map((r) => r.name).join(' / ')}`;
+  desc += ` · ${activeBuffer.label} buffer (${activeBuffer.hlsTime}s segs)`;
   pushLog(`[broadcast] starting "${channel.name}" [${desc}] (${streamUrl})`);
   launch({ fresh: true });
   return getStatus();
@@ -548,6 +611,7 @@ export function getStatus() {
     error: state.error,
     masterUrl: '/media/master.m3u8',
     mode: activeMode, // 'transcode' | 'copy' | 'hybrid'
+    buffer: activeBuffer.name, // 'low' | 'balanced' | 'safe'
     ladder:
       activeMode === 'copy'
         ? [] // pass-through has no ABR ladder
@@ -575,6 +639,16 @@ export function getRungCatalog() {
     height: r.height,
     width: r.width,
     vbitrate: r.vbitrate,
+  }));
+}
+
+// The latency/buffer presets the Control Room offers (low→safe).
+export function getBufferPresets() {
+  return Object.values(BUFFER_PRESETS).map((p) => ({
+    name: p.name,
+    label: p.label,
+    hlsTime: Number(p.hlsTime),
+    approxLatency: Number(p.hlsTime) * 3, // rough seconds behind live
   }));
 }
 
