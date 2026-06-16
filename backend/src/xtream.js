@@ -35,6 +35,12 @@ async function playerApi(action, params = {}) {
   try {
     return JSON.parse(text);
   } catch {
+    // Some panels return a bare text body (HTTP 200, application/json) on a
+    // rejected login instead of JSON. Treat that as an auth failure, which is
+    // what it almost always is, rather than a vague "invalid data" error.
+    if (/invalid\s+authorization|404\s+error|invalid\s+user/i.test(text)) {
+      throw new Error('Authentication failed — wrong username/password or host');
+    }
     throw new Error('IPTV server returned invalid data — check the host URL and credentials');
   }
 }

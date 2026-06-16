@@ -31,12 +31,63 @@ let proc = null; // current ffmpeg child
 let intended = null; // { channel, streamUrl } — set means "keep it running"
 let restartTimer = null;
 let liveWatch = null;
-let restarts = 0;
+let restarts = 0; // consecutive failed (re)connect attempts since last LIVE
+let rejections = 0; // consecutive attempts that ended in an active server rejection
+let sawRejection = false; // did the *current* ffmpeg run get rejected by the server?
 const logBuffer = [];
+
+// Backoff tuning. Two regimes:
+//  - normal failures (network blip, source dropped): fast recovery, low ceiling
+//  - active rejection (403/401/429/509/503, "Forbidden", "Too many"…): the
+//    server is telling us to back off. Retrying through that is what turns a
+//    temporary throttle into a ban, so we wait MUCH longer.
+// Minimum gap between tearing down one connection and opening the next. On a
+// max_connections=1 line the server keeps counting the old session as "active"
+// for a few seconds after our socket drops, so reconnecting too fast trips its
+// own connection limit and we reject ourselves. Never reconnect faster than this.
+const RECONNECT_FLOOR = 6000; // ≥ 6s lets the upstream slot free up first
+const BACKOFF_BASE = 3000; // first normal retry ≈ 3s (then floored to 6s)
+const BACKOFF_CEIL = 60_000; // normal retries cap at ~60s (fast recovery)
+// Rejection cooldown. Tuned for live sport on a max_connections=1 line: the
+// usual cause of a rejection here is a momentary self-clash (our previous
+// session not yet released by the server), which clears in seconds — so a short
+// 1–3 min cooldown recovers you mid-match. It's still far too slow to look like
+// a DoS. If the provider genuinely blocks aggressively, raise these back up.
+const REJECT_MIN = 60_000; // rejection cooldown: 1 min …
+const REJECT_MAX = 3 * 60_000; // … to 3 min, randomized
+const KILL_GRACE = 4000; // wait this long for a clean exit before SIGKILL
+
+// Lines in ffmpeg's stderr that mean the server actively refused us, as opposed
+// to a transient/network failure. Matched case-insensitively.
+const REJECTION_RE =
+  /\b(401|403|429|503|509)\b|forbidden|unauthorized|too many requests|server returned 4\d\d|service unavailable|connection limit|max.*connection/i;
+
+// Symmetric jitter: returns ms in [base*0.7, base*1.3], so retries never land
+// on an exact grid (deterministic clockwork reconnects are easy to fingerprint
+// as a bot). Uses Date-free randomness so it stays deterministic-safe here.
+function jitter(ms) {
+  const spread = ms * 0.3;
+  return Math.round(ms - spread + Math.random() * spread * 2);
+}
 
 function pushLog(line) {
   logBuffer.push(line);
   if (logBuffer.length > 80) logBuffer.shift();
+}
+
+// Stop an ffmpeg child as politely as possible: SIGTERM first so it closes the
+// upstream HTTP connection cleanly (the server then frees our slot right away),
+// with a SIGKILL fallback if it ignores us. Detaching it from `proc` is the
+// caller's job *before* calling this, so the exit handler treats it as superseded.
+function killChild(child) {
+  if (!child) return;
+  try { child.kill('SIGTERM'); } catch {}
+  const t = setTimeout(() => {
+    try { child.kill('SIGKILL'); } catch {}
+  }, KILL_GRACE);
+  // Don't keep the event loop alive just for the fallback timer.
+  if (typeof t.unref === 'function') t.unref();
+  child.once('exit', () => clearTimeout(t));
 }
 
 function cleanMedia() {
@@ -83,9 +134,19 @@ function buildArgs(streamUrl) {
     '-probesize', '10M',
     '-fflags', '+genpts+discardcorrupt',
     '-err_detect', 'ignore_err',
+    // ffmpeg's own reconnect rides out brief mid-stream network drops without a
+    // full process restart (polite — one TCP reconnect, not a new player_api
+    // session). Crucially we DON'T reconnect on HTTP *error* responses: a
+    // 4xx/5xx means the server actively refused us, so ffmpeg exits and hands
+    // control to scheduleRestart(), which applies the long rejection cooldown
+    // instead of letting ffmpeg silently re-poke the server every few seconds.
     '-reconnect', '1',
     '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
+    '-reconnect_on_network_error', '1',
+    // (we deliberately do NOT set -reconnect_on_http_error: the default is to
+    // NOT reconnect on 4xx/5xx, so an active rejection exits and our outer loop
+    // applies the long cooldown.)
+    '-reconnect_delay_max', '8',
     '-rw_timeout', '20000000',
     '-i', streamUrl,
     '-filter_complex', fc,
@@ -146,7 +207,12 @@ function spawnFfmpeg(streamUrl) {
 
   child.stderr.on('data', (d) => {
     String(d).split(/\r?\n/).forEach((ln) => {
-      if (ln.trim()) pushLog('[ffmpeg] ' + ln.trim());
+      const t = ln.trim();
+      if (!t) return;
+      pushLog('[ffmpeg] ' + t);
+      // Flag if the source actively rejected this connection. Only meaningful
+      // for the current process; superseded ones are ignored on exit anyway.
+      if (proc === child && REJECTION_RE.test(t)) sawRejection = true;
     });
   });
   child.stdout.on('data', () => {});
@@ -180,14 +246,38 @@ function spawnFfmpeg(streamUrl) {
 function scheduleRestart() {
   if (restartTimer || !intended) return;
   restarts += 1;
+
   // Auto-reconnect to the same channel indefinitely — never give up on our own.
   // Only an explicit stop() (or selecting a new channel) halts the loop, so a
-  // source that drops will self-heal whenever it comes back. Exponential backoff
-  // capped at 30s keeps a persistently-dead source from hammering logs/CPU.
-  state.status = 'reconnecting';
-  state.error = `Reconnecting to "${intended.channel?.name ?? 'channel'}" (attempt ${restarts})…`;
-  const delay = Math.min(2000 * restarts, 30000);
-  pushLog(`[broadcast] reconnect attempt #${restarts} in ${delay}ms`);
+  // source that drops will self-heal whenever it comes back.
+  //
+  // Two backoff regimes keep us from looking like a DoS / getting IP-banned:
+  //  - if the last run was actively REJECTED by the server, wait a long,
+  //    randomized cooldown (10–30 min). Hammering through a "you're blocked /
+  //    too many connections" response is what escalates a throttle into a ban.
+  //  - otherwise (transient drop) use jittered exponential backoff capped at
+  //    ~60s for fast recovery when the source comes back.
+  const channelName = intended.channel?.name ?? 'channel';
+  let delay;
+  if (sawRejection) {
+    rejections += 1;
+    delay = jitter(REJECT_MIN + Math.random() * (REJECT_MAX - REJECT_MIN));
+    const mins = Math.round(delay / 60_000);
+    state.status = 'reconnecting';
+    state.error = `Source refused the connection — cooling down ~${mins} min before retrying "${channelName}" (rejection #${rejections})…`;
+    pushLog(`[broadcast] server rejection — cooldown ${Math.round(delay / 1000)}s before retry`);
+  } else {
+    rejections = 0;
+    // Exponential: base * 2^(n-1), then jittered, then clamped to
+    // [RECONNECT_FLOOR, BACKOFF_CEIL]. The floor guarantees we never reconnect
+    // before the upstream has released our previous connection slot.
+    const raw = Math.min(BACKOFF_BASE * 2 ** (restarts - 1), BACKOFF_CEIL);
+    delay = Math.min(Math.max(jitter(raw), RECONNECT_FLOOR), BACKOFF_CEIL);
+    state.status = 'reconnecting';
+    state.error = `Reconnecting to "${channelName}" (attempt ${restarts})…`;
+    pushLog(`[broadcast] reconnect attempt #${restarts} in ${Math.round(delay / 1000)}s`);
+  }
+
   restartTimer = setTimeout(() => {
     restartTimer = null;
     if (intended) launch();
@@ -207,6 +297,7 @@ function watchForLive() {
       state.status = 'live';
       state.error = null;
       restarts = 0;
+      rejections = 0;
       clearInterval(liveWatch);
       liveWatch = null;
       pushLog('[broadcast] LIVE — segments are flowing');
@@ -218,7 +309,7 @@ function watchForLive() {
       if (proc) {
         const p = proc;
         proc = null;
-        try { p.kill('SIGKILL'); } catch {}
+        killChild(p); // graceful — lets the upstream slot free before we retry
         if (intended) scheduleRestart();
       }
     }
@@ -231,6 +322,7 @@ function launch({ fresh = false } = {}) {
   // blanking; ffmpeg's delete_segments flag rolls the live window forward once
   // new segments start flowing.
   if (fresh) cleanMedia();
+  sawRejection = false; // fresh per-run flag; set by stderr scanning if rejected
   proc = spawnFfmpeg(intended.streamUrl);
   watchForLive();
 }
@@ -238,14 +330,34 @@ function launch({ fresh = false } = {}) {
 // --- public API ---
 
 export async function start(channel, streamUrl) {
-  stop(); // hard-stop whatever is running
+  const hadProc = Boolean(proc);
+  stop(); // hard-stop whatever is running (graceful: sends SIGTERM, frees the slot)
+  // On a max_connections=1 line we must not open the new connection while the
+  // old one is still closing, or the server rejects us for exceeding the limit.
+  // Give the previous process a moment to release its upstream slot first.
+  if (hadProc) {
+    pushLog('[broadcast] waiting for previous connection to release before switching…');
+    await waitForSlotRelease();
+  }
   intended = { channel, streamUrl };
   restarts = 0;
+  rejections = 0;
+  sawRejection = false;
   logBuffer.length = 0;
   state = { status: 'starting', channel, startedAt: Date.now(), error: null };
   pushLog(`[broadcast] starting "${channel.name}" (${streamUrl})`);
   launch({ fresh: true });
   return getStatus();
+}
+
+// Small pause to let the upstream free the previous connection slot. Short
+// enough to feel instant to the admin, long enough that a 1-connection line
+// doesn't reject the new session. Date-free so it stays deterministic-safe.
+function waitForSlotRelease() {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, RECONNECT_FLOOR);
+    if (typeof t.unref === 'function') t.unref();
+  });
 }
 
 export function stop() {
@@ -255,7 +367,7 @@ export function stop() {
   if (proc) {
     const p = proc;
     proc = null;
-    try { p.kill('SIGKILL'); } catch {}
+    killChild(p);
   }
   state = { status: 'idle', channel: null, startedAt: null, error: null };
   return getStatus();
