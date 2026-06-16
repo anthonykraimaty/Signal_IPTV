@@ -19,6 +19,24 @@ import { useAuth } from '../auth.jsx';
 // Synthetic "package" representing the current user's favorites.
 const FAV_CAT = { category_id: '__fav__', category_name: '★ Favorites' };
 
+// Persist small UI prefs (broadcast mode, picked rungs) across page refreshes.
+const PREF_NS = 'signal.';
+function loadPref(key, fallback) {
+  try {
+    const raw = localStorage.getItem(PREF_NS + key);
+    return raw == null ? fallback : JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+function savePref(key, value) {
+  try {
+    localStorage.setItem(PREF_NS + key, JSON.stringify(value));
+  } catch {
+    /* storage unavailable (private mode / quota) — non-fatal */
+  }
+}
+
 export default function Admin() {
   const { is } = useAuth();
   const isAdmin = is('admin');
@@ -41,9 +59,14 @@ export default function Admin() {
   // Broadcast mode: 'hybrid' (source as-is + downscale rungs), 'transcode'
   // (re-encode all rungs), or 'copy' (pass-through only). Hybrid is the default:
   // full-quality top with almost no CPU, plus fallbacks for weak connections.
-  const [bcMode, setBcMode] = useState('hybrid');
+  // Persisted to localStorage so the choice survives a page refresh.
+  const [bcMode, setBcMode] = useState(() => loadPref('bcMode', 'hybrid'));
   const [rungCatalog, setRungCatalog] = useState([]); // [{name,height,width,vbitrate}]
-  const [pickedRungs, setPickedRungs] = useState(['480p', '360p']);
+  const [pickedRungs, setPickedRungs] = useState(() => loadPref('pickedRungs', ['480p', '360p']));
+
+  // Persist broadcast-mode prefs whenever they change.
+  useEffect(() => savePref('bcMode', bcMode), [bcMode]);
+  useEffect(() => savePref('pickedRungs', pickedRungs), [pickedRungs]);
 
   // Channel info from ffprobe, keyed by streamId: { loading, info, error }.
   const [chInfo, setChInfo] = useState({});
@@ -253,6 +276,22 @@ export default function Admin() {
   const starting = b?.status === 'starting' || reconnecting;
   const errored = b?.status === 'error';
 
+  // The mode/rungs actually running, vs. what the picker now shows. Used to nudge
+  // the user that a live change won't take effect until the channel is relaunched.
+  const liveMode = b?.mode || null;
+  // For hybrid the status ladder is ['source', …encoded rungs]; strip 'source'.
+  const liveRungs = (b?.ladder || []).map((r) => r.name).filter((n) => n !== 'source');
+  const wantRungs = bcMode === 'copy' ? [] : pickedRungs;
+  const sameSet = (a, c) => a.length === c.length && [...a].sort().join() === [...c].sort().join();
+  const settingsDiffer =
+    (live || starting) && b?.channel && (liveMode !== bcMode || !sameSet(liveRungs, wantRungs));
+
+  // Re-launch the currently-live channel with the picker's current settings.
+  async function relaunchLive() {
+    if (!b?.channel) return;
+    await goLive({ stream_id: b.channel.id, name: b.channel.name, icon: b.channel.icon });
+  }
+
   const viewingFavs = activeCat?.category_id === FAV_CAT.category_id;
   // In the favorites view, render the saved favorites as stream-shaped cards.
   const sourceStreams = viewingFavs
@@ -443,6 +482,24 @@ export default function Admin() {
                   {pickedRungs.length === 0 && (
                     <div className="bcmode-warn">Pick at least one resolution.</div>
                   )}
+                </div>
+              )}
+
+              {settingsDiffer && (
+                <div className="bcmode-apply">
+                  <span>Changes apply on next Go live.</span>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    onClick={relaunchLive}
+                    disabled={
+                      busy ||
+                      ((bcMode === 'transcode' || bcMode === 'hybrid') && pickedRungs.length === 0)
+                    }
+                    title={`Re-launch "${b?.channel?.name}" with these settings`}
+                  >
+                    ↻ Apply now
+                  </button>
                 </div>
               )}
             </div>
