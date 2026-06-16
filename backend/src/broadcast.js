@@ -10,6 +10,12 @@ const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 const X264_PRESET = process.env.X264_PRESET || 'ultrafast';
 const HLS_TIME = process.env.HLS_TIME || '4';
 const HLS_LIST_SIZE = process.env.HLS_LIST_SIZE || '6';
+// Output frame rate the transcode ladder is normalized to. The fps filter +
+// -fps_mode cfr rebuild a constant-rate timeline from the source's broken one,
+// so a feed that emits timestamp discontinuities still produces whole segments.
+// Keep it ≤ the source's real fps (25 covers PAL/50i sport; raise for 30/60fps
+// sources). -g 48 then puts a keyframe every ~2s, aligned with HLS_TIME.
+const FPS = process.env.OUTPUT_FPS || '25';
 
 // Catalog of every transcode rung we can produce, best first. The admin picks
 // which of these to include per broadcast (the "ladder"); more rungs = more
@@ -213,14 +219,23 @@ function buildTranscodeArgs(streamUrl) {
   const n = ladder.length;
 
   // Split the decoded video into N copies, then scale+pad each to an exact size.
-  let fc = `[0:v]split=${n}${ladder.map((_, i) => `[v${i}]`).join('')};`;
+  // setpts=PTS-STARTPTS + fps rebuilds a clean, monotonic, constant-rate
+  // timeline from the source's broken one: unstable IPTV feeds emit timestamp
+  // discontinuities and non-monotonic DTS (the source splicing/restarting its
+  // own encoder), which otherwise propagate into broken HLS segments and starve
+  // the player. Re-stamping here is the whole reason transcode survives a feed
+  // that copy/hybrid can't — the copied rung has no decoded frames to re-stamp.
+  let fc = `[0:v]setpts=PTS-STARTPTS,split=${n}${ladder.map((_, i) => `[v${i}]`).join('')};`;
   ladder.forEach((r, i) => {
     fc +=
       `[v${i}]scale=w=${r.width}:h=${r.height}:force_original_aspect_ratio=decrease,` +
-      `pad=${r.width}:${r.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}out];`;
+      `pad=${r.width}:${r.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FPS}[v${i}out];`;
   });
   fc = fc.replace(/;$/, '');
 
+  // Resample audio asynchronously so the source's backward/non-monotonic audio
+  // DTS ("Queue input is backward in time") gets stretched/padded into a clean
+  // timeline instead of forwarded as-is. Applied per-rung below via -af.
   const args = [...inputArgs(streamUrl), '-filter_complex', fc];
 
   // One video encoder per rung.
@@ -235,16 +250,24 @@ function buildTranscodeArgs(streamUrl) {
   });
 
   // One audio encoder per rung (same source audio, re-encoded to AAC for HLS).
+  // aresample=async=1:first_pts=0 repairs the source's non-monotonic audio DTS
+  // by stretching/padding samples to a continuous timeline (instead of letting
+  // "Queue input is backward in time" corrupt the segment).
   ladder.forEach((r, i) => {
     args.push(
       '-map', 'a:0?',
       `-c:a:${i}`, 'aac',
       `-b:a:${i}`, r.abitrate,
+      `-filter:a:${i}`, 'aresample=async=1:first_pts=0',
       '-ac', '2',
     );
   });
 
   // Global encoder settings — aligned GOPs so clients can switch rungs cleanly.
+  // -fps_mode cfr forces constant frame rate on output: combined with the fps
+  // filter above, ffmpeg duplicates/drops frames across a source discontinuity
+  // rather than emitting a gap, so the HLS segment stays whole and the player's
+  // buffer doesn't drain. -muxpreload/-muxdelay 0 keeps live latency low.
   args.push(
     '-preset', X264_PRESET,
     '-profile:v', 'main',
@@ -252,6 +275,9 @@ function buildTranscodeArgs(streamUrl) {
     '-keyint_min', '48',
     '-sc_threshold', '0',
     '-pix_fmt', 'yuv420p',
+    '-fps_mode', 'cfr',
+    '-muxpreload', '0',
+    '-muxdelay', '0',
   );
 
   args.push(...hlsOutputArgs(ladder.map((_, i) => `v:${i},a:${i}`).join(' ')));

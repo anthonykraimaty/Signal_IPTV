@@ -25,10 +25,22 @@ export default function Player({ src }) {
         const hls = new Hls({
           enableWorker: true,
           lowLatencyMode: false,
-          maxBufferLength: 24,
-          maxMaxBufferLength: 60,
+          // Forward buffer the player tries to keep ahead of playback. A deeper
+          // buffer lets the player ride out a source drop/discontinuity (common
+          // on flaky IPTV feeds) without the spinner — at the cost of starting
+          // further behind live. 36s fwd / 90s cap absorbs ~9 segments.
+          maxBufferLength: 36,
+          maxMaxBufferLength: 90,
           backBufferLength: 30,
-          liveSyncDurationCount: 3,
+          // Start ~5 segments (≈20s at HLS_TIME=4) behind the live edge so there
+          // is buffered runway when the source hiccups. Higher = safer but more
+          // delay behind real-time. liveMaxLatencyDurationCount bounds how far we
+          // ever fall behind before the player snaps back toward live.
+          liveSyncDurationCount: 5,
+          liveMaxLatencyDurationCount: 12,
+          // Don't stall waiting on one bad segment — skip past a gap the source
+          // left rather than buffering forever on it.
+          nudgeMaxRetry: 8,
           abrEwmaDefaultEstimate: 1_200_000,
           startLevel: -1,
           capLevelToPlayerSize: true,
