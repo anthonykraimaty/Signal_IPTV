@@ -11,6 +11,8 @@ import {
   getFavorites,
   addFavorite,
   removeFavorite,
+  getBroadcastModes,
+  probeChannel,
 } from '../api.js';
 import { useAuth } from '../auth.jsx';
 
@@ -36,9 +38,18 @@ export default function Admin() {
 
   const [favorites, setFavorites] = useState([]); // [{streamId, name, icon, categoryId}]
 
+  // Broadcast mode: pass-through ("as is") vs transcode down to chosen rungs.
+  const [bcMode, setBcMode] = useState('transcode'); // 'transcode' | 'copy'
+  const [rungCatalog, setRungCatalog] = useState([]); // [{name,height,width,vbitrate}]
+  const [pickedRungs, setPickedRungs] = useState(['480p', '360p']);
+
+  // Channel info from ffprobe, keyed by streamId: { loading, info, error }.
+  const [chInfo, setChInfo] = useState({});
+
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [note, setNote] = useState(null); // transient notice (e.g. HEVC fallback)
 
   const [showLogs, setShowLogs] = useState(false);
   const [logs, setLogs] = useState([]);
@@ -57,6 +68,9 @@ export default function Admin() {
     loadCategories();
     loadFavorites();
     refreshStatus();
+    getBroadcastModes()
+      .then((rungs) => setRungCatalog(rungs))
+      .catch(() => {});
     const id = setInterval(refreshStatus, 4000);
     return () => clearInterval(id);
   }, [isAdmin]);
@@ -165,15 +179,49 @@ export default function Admin() {
     }
   }
 
-  async function goLive(stream) {
+  function toggleRung(name) {
+    setPickedRungs((cur) =>
+      cur.includes(name) ? cur.filter((r) => r !== name) : [...cur, name],
+    );
+  }
+
+  // Probe a channel for codec/resolution (fast). Bitrate is measured only on
+  // demand (withBitrate) since it's slower and holds the upstream connection.
+  async function loadChannelInfo(stream, withBitrate = false) {
+    const id = stream.stream_id ?? stream.streamId;
+    const cached = chInfo[id];
+    if (!withBitrate && (cached?.info || cached?.loading)) return; // cached / in flight
+    if (withBitrate && cached?.measuring) return;
+    setChInfo((m) => ({
+      ...m,
+      [id]: { ...cached, loading: !cached?.info, measuring: withBitrate },
+    }));
+    try {
+      const info = await probeChannel(id, withBitrate);
+      setChInfo((m) => ({ ...m, [id]: { loading: false, measuring: false, info } }));
+    } catch (e) {
+      setChInfo((m) => ({
+        ...m,
+        [id]: { ...m[id], loading: false, measuring: false, error: e.message },
+      }));
+    }
+  }
+
+  async function goLive(stream, modeOverride) {
     setBusy(true);
     setErr(null);
+    setNote(null);
+    // Pass-through with no rungs makes no sense; default to the picked ladder.
+    const mode = modeOverride || bcMode;
     try {
-      await startBroadcast({
+      const res = await startBroadcast({
         streamId: stream.stream_id ?? stream.streamId,
         name: stream.name,
         icon: stream.stream_icon ?? stream.icon,
+        mode,
+        rungs: mode === 'copy' ? [] : pickedRungs,
       });
+      if (res?.fallbackNote) setNote(res.fallbackNote);
       await refreshStatus();
     } catch (e) {
       setErr(e.message);
@@ -237,7 +285,10 @@ export default function Admin() {
         </div>
         <div className="onair-meta">
           {b?.error && <span className="onair-errtext">{b.error}</span>}
-          {b?.ladder && (live || starting) && (
+          {(live || starting) && b?.mode === 'copy' && (
+            <span className="onair-ladder">as-is (pass-through)</span>
+          )}
+          {(live || starting) && b?.mode !== 'copy' && b?.ladder?.length > 0 && (
             <span className="onair-ladder">{b.ladder.map((r) => r.name).join(' / ')}</span>
           )}
         </div>
@@ -258,6 +309,7 @@ export default function Admin() {
       )}
 
       {err && <div className="banner-err">{err}</div>}
+      {note && <div className="banner-note">{note}</div>}
 
       <div className="admin-grid">
         {/* ---- left column ---- */}
@@ -308,6 +360,69 @@ export default function Admin() {
               </button>
               {credMsg && <div className="form-ok">✓ {credMsg}</div>}
             </form>
+          </section>
+
+          <section className="panel">
+            <div className="panel-head">
+              <h2>Broadcast mode</h2>
+              <span className={'chip ' + (bcMode === 'copy' ? 'chip-wait' : 'chip-ok')}>
+                {bcMode === 'copy' ? 'as-is' : 'transcode'}
+              </span>
+            </div>
+            <div className="bcmode">
+              <label className="bcmode-opt">
+                <input
+                  type="radio"
+                  name="bcmode"
+                  checked={bcMode === 'transcode'}
+                  onChange={() => setBcMode('transcode')}
+                />
+                <span>
+                  <strong>Compress down</strong>
+                  <small>Re-encode to the rungs below (adaptive quality).</small>
+                </span>
+              </label>
+              <label className="bcmode-opt">
+                <input
+                  type="radio"
+                  name="bcmode"
+                  checked={bcMode === 'copy'}
+                  onChange={() => setBcMode('copy')}
+                />
+                <span>
+                  <strong>Broadcast as-is</strong>
+                  <small>
+                    Pass through, no re-encode (lowest CPU, single quality).
+                    HEVC sources auto-transcode.
+                  </small>
+                </span>
+              </label>
+
+              {bcMode === 'transcode' && (
+                <div className="bcmode-rungs">
+                  <span className="bcmode-rungs-label">Resolutions</span>
+                  <div className="rung-grid">
+                    {rungCatalog.map((r) => {
+                      const on = pickedRungs.includes(r.name);
+                      return (
+                        <button
+                          key={r.name}
+                          type="button"
+                          className={'rung-chip' + (on ? ' on' : '')}
+                          onClick={() => toggleRung(r.name)}
+                          title={`${r.width}×${r.height} · ${r.vbitrate}`}
+                        >
+                          {r.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {pickedRungs.length === 0 && (
+                    <div className="bcmode-warn">Pick at least one resolution.</div>
+                  )}
+                </div>
+              )}
+            </div>
           </section>
 
           <section className="panel grow">
@@ -397,7 +512,10 @@ export default function Admin() {
                 <div
                   key={s.stream_id}
                   className={'chcard' + (isSel ? ' sel' : '') + (onAir ? ' onair-card' : '')}
-                  onClick={() => setSelected(s)}
+                  onClick={() => {
+                    setSelected(s);
+                    loadChannelInfo(s);
+                  }}
                 >
                   <button
                     className={'chfav' + (fav ? ' on' : '')}
@@ -417,6 +535,12 @@ export default function Admin() {
                   <div className="chname" title={s.name}>
                     {s.name}
                   </div>
+                  {isSel && (
+                    <ChannelInfo
+                      state={chInfo[s.stream_id]}
+                      onMeasure={() => loadChannelInfo(s, true)}
+                    />
+                  )}
                   {onAir ? (
                     <span className="chbadge live">on air</span>
                   ) : (
@@ -426,7 +550,12 @@ export default function Admin() {
                         e.stopPropagation();
                         goLive(s);
                       }}
-                      disabled={busy}
+                      disabled={busy || (bcMode === 'transcode' && pickedRungs.length === 0)}
+                      title={
+                        bcMode === 'transcode' && pickedRungs.length === 0
+                          ? 'Pick at least one resolution'
+                          : `Go live (${bcMode === 'copy' ? 'as-is' : pickedRungs.join('/')})`
+                      }
                     >
                       ▶ Go live
                     </button>
@@ -437,6 +566,55 @@ export default function Admin() {
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+// Compact source-info readout for the selected channel: codec, resolution, fps
+// and (on demand) bitrate, probed live — Xtream's API exposes none of this.
+function ChannelInfo({ state, onMeasure }) {
+  if (!state || (state.loading && !state.info)) {
+    return <div className="chinfo chinfo-loading">reading stream…</div>;
+  }
+  if (state.error && !state.info) {
+    return <div className="chinfo chinfo-err" title={state.error}>info unavailable</div>;
+  }
+  const i = state.info;
+  if (!i) return null;
+  const v = i.video || {};
+  const codec = (v.codec || '?').toUpperCase();
+  const res = v.resolution || (v.height ? v.height + 'p' : '?');
+  const fps = v.fps ? `${v.fps}fps` : null;
+  const rate = i.bitrateKbps ? `${(i.bitrateKbps / 1000).toFixed(1)} Mbps` : null;
+  return (
+    <div className="chinfo">
+      <span
+        className={'chinfo-tag' + (i.browserPlayable ? '' : ' warn')}
+        title={i.browserPlayable ? 'Browser-playable' : 'Not browser-playable — will auto-transcode'}
+      >
+        {codec}
+      </span>
+      <span className="chinfo-tag">{res}</span>
+      {fps && <span className="chinfo-tag">{fps}</span>}
+      {rate ? (
+        <span className="chinfo-tag" title={i.bitrateEstimated ? 'Measured' : 'Reported'}>
+          {rate}
+        </span>
+      ) : state.measuring ? (
+        <span className="chinfo-tag chinfo-measuring">measuring…</span>
+      ) : (
+        <button
+          type="button"
+          className="chinfo-btn"
+          onClick={(e) => {
+            e.stopPropagation();
+            onMeasure?.();
+          }}
+          title="Measure bitrate (briefly opens the stream)"
+        >
+          measure bitrate
+        </button>
+      )}
     </div>
   );
 }

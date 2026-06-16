@@ -11,14 +11,31 @@ const X264_PRESET = process.env.X264_PRESET || 'ultrafast';
 const HLS_TIME = process.env.HLS_TIME || '4';
 const HLS_LIST_SIZE = process.env.HLS_LIST_SIZE || '6';
 
-// Adaptive-bitrate ladder, best first. The server holds HD and downscales
-// to give weaker clients something they can sustain without buffering.
-// Trimmed to two rungs (480p/360p) to fit CPU-bound transcoding on a modest
-// VPS — add a 720p rung back here if you have CPU/GPU headroom.
-const LADDER = [
-  { name: '480p', width: 854, height: 480, vbitrate: '1400k', maxrate: '1500k', bufsize: '2100k', abitrate: '128k' },
-  { name: '360p', width: 640, height: 360, vbitrate: '700k', maxrate: '750k', bufsize: '1100k', abitrate: '96k' },
-];
+// Catalog of every transcode rung we can produce, best first. The admin picks
+// which of these to include per broadcast (the "ladder"); more rungs = more
+// adaptive-bitrate options for clients but more CPU. 720p is heavy on a modest
+// VPS — include it only with CPU/GPU headroom.
+const RUNG_CATALOG = {
+  '720p': { name: '720p', width: 1280, height: 720, vbitrate: '2800k', maxrate: '3000k', bufsize: '4200k', abitrate: '128k' },
+  '480p': { name: '480p', width: 854, height: 480, vbitrate: '1400k', maxrate: '1500k', bufsize: '2100k', abitrate: '128k' },
+  '360p': { name: '360p', width: 640, height: 360, vbitrate: '700k', maxrate: '750k', bufsize: '1100k', abitrate: '96k' },
+};
+const DEFAULT_RUNGS = ['480p', '360p']; // matches the previous hard-coded ladder
+
+// Resolve a requested rung list (e.g. ['720p','480p']) to catalog entries,
+// best-first, ignoring unknown names; falls back to the default ladder if empty.
+function resolveRungs(names) {
+  const order = Object.keys(RUNG_CATALOG); // already best→worst
+  const want = new Set((names && names.length ? names : DEFAULT_RUNGS).map(String));
+  const picked = order.filter((k) => want.has(k)).map((k) => RUNG_CATALOG[k]);
+  return picked.length ? picked : DEFAULT_RUNGS.map((k) => RUNG_CATALOG[k]);
+}
+
+// The broadcast mode in effect for the *current* run. 'transcode' builds the
+// HLS ABR ladder (re-encodes); 'copy' is pass-through (no re-encode, single
+// quality). Set per launch from `intended.mode` / `intended.rungs`.
+let activeLadder = DEFAULT_RUNGS.map((k) => RUNG_CATALOG[k]);
+let activeMode = 'transcode';
 
 let state = {
   status: 'idle', // idle | starting | live | error
@@ -98,7 +115,12 @@ function cleanMedia() {
     for (const entry of fs.readdirSync(MEDIA_DIR)) {
       fs.rmSync(path.join(MEDIA_DIR, entry), { recursive: true, force: true });
     }
-    LADDER.forEach((_, i) => fs.mkdirSync(path.join(MEDIA_DIR, 'v' + i), { recursive: true }));
+    // One folder per output variant: the ladder rungs when transcoding, or a
+    // single v0 in copy (pass-through) mode.
+    const variants = activeMode === 'copy' ? 1 : activeLadder.length;
+    for (let i = 0; i < variants; i++) {
+      fs.mkdirSync(path.join(MEDIA_DIR, 'v' + i), { recursive: true });
+    }
   } catch (e) {
     console.error('[broadcast] clean media failed:', e.message);
   }
@@ -114,46 +136,86 @@ function masterReady() {
   }
 }
 
-function buildArgs(streamUrl) {
-  const n = LADDER.length;
-
-  // Split the decoded video into N copies, then scale+pad each to an exact size.
-  let fc = `[0:v]split=${n}${LADDER.map((_, i) => `[v${i}]`).join('')};`;
-  LADDER.forEach((r, i) => {
-    fc +=
-      `[v${i}]scale=w=${r.width}:h=${r.height}:force_original_aspect_ratio=decrease,` +
-      `pad=${r.width}:${r.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}out];`;
-  });
-  fc = fc.replace(/;$/, '');
-
-  const args = [
+// Shared input args: robustness flags for flaky IPTV sources + the reconnect
+// behaviour that hands HTTP rejections to our outer cooldown loop.
+function inputArgs(streamUrl) {
+  return [
     '-hide_banner',
     '-loglevel', 'warning',
-    // --- input robustness for flaky IPTV sources ---
     '-analyzeduration', '10M',
     '-probesize', '10M',
     '-fflags', '+genpts+discardcorrupt',
     '-err_detect', 'ignore_err',
     // ffmpeg's own reconnect rides out brief mid-stream network drops without a
     // full process restart (polite — one TCP reconnect, not a new player_api
-    // session). Crucially we DON'T reconnect on HTTP *error* responses: a
-    // 4xx/5xx means the server actively refused us, so ffmpeg exits and hands
-    // control to scheduleRestart(), which applies the long rejection cooldown
-    // instead of letting ffmpeg silently re-poke the server every few seconds.
+    // session). We DON'T reconnect on HTTP *error* responses: a 4xx/5xx means
+    // the server actively refused us, so ffmpeg exits and scheduleRestart()
+    // applies the long rejection cooldown instead of re-poking every few seconds.
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_on_network_error', '1',
-    // (we deliberately do NOT set -reconnect_on_http_error: the default is to
-    // NOT reconnect on 4xx/5xx, so an active rejection exits and our outer loop
-    // applies the long cooldown.)
     '-reconnect_delay_max', '8',
     '-rw_timeout', '20000000',
     '-i', streamUrl,
-    '-filter_complex', fc,
   ];
+}
+
+// Shared HLS output options (segment naming, live window, etc). The caller
+// supplies the variant count and the var_stream_map.
+function hlsOutputArgs(varStreamMap) {
+  return [
+    '-f', 'hls',
+    '-hls_time', HLS_TIME,
+    '-hls_list_size', HLS_LIST_SIZE,
+    '-hls_flags', 'independent_segments+delete_segments+omit_endlist',
+    '-hls_segment_type', 'mpegts',
+    '-hls_segment_filename', 'v%v/seg_%05d.ts',
+    '-master_pl_name', 'master.m3u8',
+    '-var_stream_map', varStreamMap,
+    'v%v/index.m3u8',
+  ];
+}
+
+function buildArgs(streamUrl) {
+  return activeMode === 'copy' ? buildCopyArgs(streamUrl) : buildTranscodeArgs(streamUrl);
+}
+
+// Pass-through ("as is"): remux the source straight into HLS with NO re-encode.
+// Lowest CPU by far, single quality (no ABR). Only safe when the source video
+// codec is browser-playable (H.264) — the caller guarantees that via the probe
+// auto-fallback, so here we just copy.
+function buildCopyArgs(streamUrl) {
+  return [
+    ...inputArgs(streamUrl),
+    '-map', '0:v:0',
+    '-map', '0:a:0?',
+    '-c', 'copy',
+    // Keep timestamps sane when copying a live MPEG-TS into HLS.
+    '-copyts',
+    '-muxpreload', '0',
+    '-muxdelay', '0',
+    ...hlsOutputArgs('v:0,a:0'),
+  ];
+}
+
+// Transcode: decode once, fan out into the chosen ABR ladder (re-encoded H.264).
+function buildTranscodeArgs(streamUrl) {
+  const ladder = activeLadder;
+  const n = ladder.length;
+
+  // Split the decoded video into N copies, then scale+pad each to an exact size.
+  let fc = `[0:v]split=${n}${ladder.map((_, i) => `[v${i}]`).join('')};`;
+  ladder.forEach((r, i) => {
+    fc +=
+      `[v${i}]scale=w=${r.width}:h=${r.height}:force_original_aspect_ratio=decrease,` +
+      `pad=${r.width}:${r.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}out];`;
+  });
+  fc = fc.replace(/;$/, '');
+
+  const args = [...inputArgs(streamUrl), '-filter_complex', fc];
 
   // One video encoder per rung.
-  LADDER.forEach((r, i) => {
+  ladder.forEach((r, i) => {
     args.push(
       '-map', `[v${i}out]`,
       `-c:v:${i}`, 'libx264',
@@ -164,7 +226,7 @@ function buildArgs(streamUrl) {
   });
 
   // One audio encoder per rung (same source audio, re-encoded to AAC for HLS).
-  LADDER.forEach((r, i) => {
+  ladder.forEach((r, i) => {
     args.push(
       '-map', 'a:0?',
       `-c:a:${i}`, 'aac',
@@ -183,19 +245,7 @@ function buildArgs(streamUrl) {
     '-pix_fmt', 'yuv420p',
   );
 
-  // HLS output: one master playlist + one media playlist/segment folder per rung.
-  args.push(
-    '-f', 'hls',
-    '-hls_time', HLS_TIME,
-    '-hls_list_size', HLS_LIST_SIZE,
-    '-hls_flags', 'independent_segments+delete_segments+omit_endlist',
-    '-hls_segment_type', 'mpegts',
-    '-hls_segment_filename', 'v%v/seg_%05d.ts',
-    '-master_pl_name', 'master.m3u8',
-    '-var_stream_map', LADDER.map((_, i) => `v:${i},a:${i}`).join(' '),
-    'v%v/index.m3u8',
-  );
-
+  args.push(...hlsOutputArgs(ladder.map((_, i) => `v:${i},a:${i}`).join(' ')));
   return args;
 }
 
@@ -329,7 +379,8 @@ function launch({ fresh = false } = {}) {
 
 // --- public API ---
 
-export async function start(channel, streamUrl) {
+// opts: { mode: 'transcode' | 'copy', rungs: ['480p','360p', …] }
+export async function start(channel, streamUrl, opts = {}) {
   const hadProc = Boolean(proc);
   stop(); // hard-stop whatever is running (graceful: sends SIGTERM, frees the slot)
   // On a max_connections=1 line we must not open the new connection while the
@@ -339,13 +390,22 @@ export async function start(channel, streamUrl) {
     pushLog('[broadcast] waiting for previous connection to release before switching…');
     await waitForSlotRelease();
   }
-  intended = { channel, streamUrl };
+
+  // Lock in the broadcast mode + ladder for this run.
+  activeMode = opts.mode === 'copy' ? 'copy' : 'transcode';
+  activeLadder = resolveRungs(opts.rungs);
+
+  intended = { channel, streamUrl, mode: activeMode, rungs: activeLadder.map((r) => r.name) };
   restarts = 0;
   rejections = 0;
   sawRejection = false;
   logBuffer.length = 0;
   state = { status: 'starting', channel, startedAt: Date.now(), error: null };
-  pushLog(`[broadcast] starting "${channel.name}" (${streamUrl})`);
+  const desc =
+    activeMode === 'copy'
+      ? 'pass-through (as-is, no re-encode)'
+      : `transcode → ${activeLadder.map((r) => r.name).join(' / ')}`;
+  pushLog(`[broadcast] starting "${channel.name}" [${desc}] (${streamUrl})`);
   launch({ fresh: true });
   return getStatus();
 }
@@ -380,8 +440,29 @@ export function getStatus() {
     startedAt: state.startedAt,
     error: state.error,
     masterUrl: '/media/master.m3u8',
-    ladder: LADDER.map((r) => ({ name: r.name, height: r.height, vbitrate: r.vbitrate })),
+    mode: activeMode, // 'transcode' | 'copy'
+    ladder:
+      activeMode === 'copy'
+        ? [] // pass-through has no ABR ladder
+        : activeLadder.map((r) => ({ name: r.name, height: r.height, vbitrate: r.vbitrate })),
   };
+}
+
+// Is a broadcast currently holding (or trying to hold) the upstream connection?
+// Used to avoid probing a different channel on a max_connections=1 line, which
+// would trip the limit. Returns the live channel id, or null when idle.
+export function activeChannelId() {
+  return intended ? intended.channel?.id ?? null : null;
+}
+
+// The full rung catalog the UI offers (best→worst), for the broadcast-mode panel.
+export function getRungCatalog() {
+  return Object.values(RUNG_CATALOG).map((r) => ({
+    name: r.name,
+    height: r.height,
+    width: r.width,
+    vbitrate: r.vbitrate,
+  }));
 }
 
 export function getLogs() {

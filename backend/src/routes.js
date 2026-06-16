@@ -1,6 +1,7 @@
 import express from 'express';
 import * as xtream from './xtream.js';
 import * as broadcast from './broadcast.js';
+import { probeStream } from './probe.js';
 import { getXtream, setXtream, isConfigured } from './config.js';
 import {
   verifyPassword,
@@ -212,24 +213,80 @@ router.get('/categories/:id/streams', requireRole('control'), async (req, res) =
 });
 
 // ============================================================
+//  Channel info  (control+ — probe the live source for codec/res/bitrate)
+// ============================================================
+
+// Xtream's API exposes no codec/resolution/bitrate, so we open the stream and
+// read it with ffprobe. This briefly opens ONE connection to the source — on a
+// max_connections=1 line, don't probe while a broadcast of a different channel
+// is live, or it will trip the connection limit.
+router.get('/channels/:id/probe', requireRole('control'), async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(400).json({ error: 'Configure Xtream credentials first' });
+    }
+    // On a 1-connection line, probing a different channel while one is on air
+    // trips the connection limit. Refuse rather than disrupt the live broadcast.
+    const onAir = broadcast.activeChannelId();
+    const reqId = req.params.id;
+    if (onAir != null && String(onAir) !== String(reqId)) {
+      return res
+        .status(409)
+        .json({ error: 'A broadcast is live — stop it before probing another channel.' });
+    }
+    const url = xtream.buildStreamUrl(reqId);
+    const result = await probeStream(url, { measureBitrate: req.query.bitrate === '1' });
+    if (!result.ok) {
+      return res.status(502).json({ error: result.error || 'Could not read stream info' });
+    }
+    res.json({ info: result.info });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ============================================================
 //  Broadcast control  (control+)
 // ============================================================
+
+// Expose the available transcode rungs so the broadcast-mode panel can render
+// a checkbox per rung.
+router.get('/broadcast/modes', requireRole('control'), (req, res) => {
+  res.json({ rungs: broadcast.getRungCatalog() });
+});
 
 router.post('/broadcast/start', requireRole('control'), async (req, res) => {
   try {
     if (!isConfigured()) {
       return res.status(400).json({ error: 'Configure Xtream credentials first' });
     }
-    const { streamId, name, icon } = req.body || {};
+    const { streamId, name, icon, mode, rungs } = req.body || {};
     if (!streamId && streamId !== 0) {
       return res.status(400).json({ error: 'streamId is required' });
     }
     const url = xtream.buildStreamUrl(streamId);
+
+    // Resolve the effective mode. 'copy' (pass-through) only works if the source
+    // is browser-playable (H.264); if the admin asked for copy but the source is
+    // HEVC/other, auto-fall back to transcode so it doesn't black-screen.
+    let effectiveMode = mode === 'copy' ? 'copy' : 'transcode';
+    let fallbackNote = null;
+    if (effectiveMode === 'copy') {
+      const probe = await probeStream(url);
+      if (probe.ok && probe.info && !probe.info.browserPlayable) {
+        effectiveMode = 'transcode';
+        fallbackNote = `Source is ${probe.info.video?.codec || 'an incompatible codec'} — not browser-playable as-is, transcoding instead.`;
+      }
+      // If the probe failed we still honor 'copy' (the source may simply be
+      // unprobeable here); the player will surface a problem if it can't decode.
+    }
+
     const status = await broadcast.start(
       { id: streamId, name: name || `Channel ${streamId}`, icon: icon || null },
       url,
+      { mode: effectiveMode, rungs },
     );
-    res.json({ ok: true, broadcast: status });
+    res.json({ ok: true, broadcast: status, fallbackNote });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }

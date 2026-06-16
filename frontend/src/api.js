@@ -103,6 +103,19 @@ export function startBroadcast(body) {
     asJson(r, 'Failed to start broadcast'),
   );
 }
+export async function getBroadcastModes() {
+  const d = await fetch('/api/broadcast/modes', opts()).then((r) =>
+    asJson(r, 'Failed to load broadcast modes'),
+  );
+  return d.rungs;
+}
+export async function probeChannel(streamId, withBitrate = false) {
+  const q = withBitrate ? '?bitrate=1' : '';
+  const d = await fetch(`/api/channels/${streamId}/probe${q}`, opts()).then((r) =>
+    asJson(r, 'Failed to read stream info'),
+  );
+  return d.info;
+}
 export function stopBroadcast() {
   return fetch('/api/broadcast/stop', opts({ method: 'POST' })).then((r) =>
     asJson(r, 'Failed to stop broadcast'),
