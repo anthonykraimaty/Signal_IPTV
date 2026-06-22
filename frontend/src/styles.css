@@ -280,6 +280,45 @@ body {
   font-weight: 500;
 }
 
+/* LIVE indicator/button in the HUD: static green when at the live edge,
+   amber + clickable when playback has drifted behind. */
+.livebtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  border-radius: 999px;
+  padding: 5px 10px;
+  margin-left: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  /* drifted (default): amber, actionable */
+  color: var(--amber);
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid var(--amber);
+}
+.livebtn:hover:not(:disabled) {
+  background: var(--amber);
+  color: var(--ink);
+}
+.livebtn.on {
+  /* at live: green, non-actionable */
+  color: var(--green);
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.5);
+  cursor: default;
+}
+.livebtn-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+}
+
 /* off-air slate */
 .offair {
   position: absolute;
