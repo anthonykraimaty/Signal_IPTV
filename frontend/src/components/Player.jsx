@@ -4,9 +4,11 @@ import Hls from 'hls.js';
 // Adaptive HLS player. hls.js measures bandwidth and auto-switches the rung
 // (720p/480p/360p) so weak connections downgrade instead of buffering.
 
-// How far (seconds) behind the live edge we still consider "at live". One
-// segment of slack so the LIVE pill doesn't flicker between frames.
-const LIVE_EDGE_SLACK = 6;
+// Normal playback deliberately sits behind the true live edge (the buffer runway
+// that rides out hiccups) — roughly liveSyncDurationCount × segment length, plus
+// a segment of slack so the pill doesn't flicker. We only flag "drifted" (amber)
+// when we're further behind than this. ~26s covers the default 5×~4s window + 6s.
+const LIVE_EDGE_SLACK = 26;
 
 // End of the seekable range = the live edge for native HLS (Safari/iOS), which
 // doesn't expose hls.js's liveSyncPosition.
@@ -82,13 +84,14 @@ export default function Player({ src }) {
         hls.loadSource(src);
         hls.attachMedia(video);
 
-        // Track whether we're at the live edge. hls.liveSyncPosition is the
-        // ideal play head for "live"; if we're well behind it, we've drifted
-        // (e.g. after a reconnect we chose not to snap back) → light up LIVE.
+        // Track distance from the TRUE live edge (end of the seekable window).
+        // Normal playback sits ~a live-sync window behind it, so only flag drift
+        // (amber) when we're further back than LIVE_EDGE_SLACK — e.g. after a
+        // reconnect we chose not to snap back. goLive() seeks to this same edge.
         const onTime = () => {
-          const target = hls.liveSyncPosition;
-          if (typeof target !== 'number' || Number.isNaN(target)) return;
-          setAtLive(target - video.currentTime <= LIVE_EDGE_SLACK);
+          const edge = seekableEnd(video);
+          if (edge == null) return;
+          setAtLive(edge - video.currentTime <= LIVE_EDGE_SLACK);
         };
         video.addEventListener('timeupdate', onTime);
         cleanups.push(() => video.removeEventListener('timeupdate', onTime));
@@ -158,20 +161,20 @@ export default function Player({ src }) {
   }, [src]);
 
   // Jump to the live edge on demand — the manual resync the high latency ceiling
-  // leaves up to the user. Works for both hls.js and Safari's native HLS.
+  // leaves up to the user. Seek to the true edge (end of the seekable/buffered
+  // window) minus a small margin, NOT hls.liveSyncPosition (which is still ~5
+  // segments behind and would leave us registering as "behind live"). Works for
+  // both hls.js and Safari's native HLS.
   function goLive() {
-    const hls = hlsRef.current;
     const video = videoRef.current;
     if (!video) return;
-    const target =
-      hls && typeof hls.liveSyncPosition === 'number' && !Number.isNaN(hls.liveSyncPosition)
-        ? hls.liveSyncPosition
-        : seekableEnd(video);
-    if (target != null) {
-      video.currentTime = target;
-      video.play().catch(() => {});
-      setAtLive(true);
-    }
+    const edge = seekableEnd(video);
+    if (edge == null) return;
+    // Sit a hair back from the very end so we don't stall on the last, still-
+    // growing segment; well within LIVE_EDGE_SLACK so the pill turns green.
+    video.currentTime = Math.max(0, edge - 1);
+    video.play().catch(() => {});
+    setAtLive(true);
   }
 
   function pick(i) {
